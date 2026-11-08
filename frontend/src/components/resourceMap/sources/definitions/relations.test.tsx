@@ -470,7 +470,7 @@ describe('useGetAllRelations', () => {
   });
 
   it('flags shared ConfigMap, Secret, NetworkPolicy and ServiceAccount edges', () => {
-    vi.spyOn(CRD, 'useList').mockReturnValue({ items: null } as ReturnType<typeof CRD.useList>);
+    vi.spyOn(CRD, 'useList').mockReturnValue({ items: null } as any);
     const { result } = renderUseGetAllRelations();
     const matchingPod = pod({ uid: 'pod', name: 'pod', namespace: 'namespace-a' }, {}, 'cluster-a');
     const configMap = new ConfigMap(
