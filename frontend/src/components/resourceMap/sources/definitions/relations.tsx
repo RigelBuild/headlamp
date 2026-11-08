@@ -175,14 +175,32 @@ const makeOwnerRelationReversed = (cl: KubeObjectClass): Relation => ({
   },
 });
 
-const configMapUsedInPods = makeRelation('pod-configmap', Pod, ConfigMap, (pod, configMap) =>
-  pod.spec.volumes?.find(volume => volume.configMap?.name === configMap.metadata.name)
+/**
+ * Edge attributes for a relation whose endpoint `side` is a resource shared by several
+ * workloads (a ConfigMap, Secret or ServiceAccount, or a NetworkPolicy selecting many pods).
+ * Marking that endpoint `nonGroupingSide` stops it from bridging the workloads into one
+ * group. The edge is still drawn. See `nonGroupingSide` in graphModel.tsx.
+ */
+const sharedEndpoint = (side: 'source' | 'target') => () => ({ nonGroupingSide: side });
+
+const configMapUsedInPods = makeRelation(
+  'pod-configmap',
+  Pod,
+  ConfigMap,
+  (pod, configMap) =>
+    pod.spec.volumes?.find(volume => volume.configMap?.name === configMap.metadata.name),
+  sharedEndpoint('target')
 );
 
-const configMapUsedInJobs = makeRelation('job-configmap', Job, ConfigMap, (job, configMap) =>
-  job.spec.template.spec.volumes?.find(
-    volume => volume?.configMap?.name === configMap.metadata.name
-  )
+const configMapUsedInJobs = makeRelation(
+  'job-configmap',
+  Job,
+  ConfigMap,
+  (job, configMap) =>
+    job.spec.template.spec.volumes?.find(
+      volume => volume?.configMap?.name === configMap.metadata.name
+    ),
+  sharedEndpoint('target')
 );
 
 const secretsUsedInPods = makeRelation(
@@ -195,13 +213,19 @@ const secretsUsedInPods = makeRelation(
     ) ??
     pod.spec.volumes?.find(volume =>
       volume.projected?.sources?.find((source: any) => source.secret?.name === secret.metadata.name)
-    )
+    ),
+  sharedEndpoint('target')
 );
 
-const secretsUsedInJobs = makeRelation('job-secret', Job, Secret, (job, secret) =>
-  job.spec.template.spec.containers?.find(container =>
-    container.env?.find(env => secret.metadata.name === env.valueFrom?.secretKeyRef?.name)
-  )
+const secretsUsedInJobs = makeRelation(
+  'job-secret',
+  Job,
+  Secret,
+  (job, secret) =>
+    job.spec.template.spec.containers?.find(container =>
+      container.env?.find(env => secret.metadata.name === env.valueFrom?.secretKeyRef?.name)
+    ),
+  sharedEndpoint('target')
 );
 
 const hpaToDeployment = makeRelation(
@@ -268,8 +292,14 @@ const ingressToSecret = makeRelation('ingress-secret', Ingress, Secret, (ingress
   ingress.spec.tls?.find(tls => tls.secretName === secret.metadata.name)
 );
 
-const networkPolicyToPod = makeRelation('networkpolicy-pod', NetworkPolicy, Pod, (np, pod) =>
-  matchesLabels(np.spec.podSelector.matchLabels ?? {}, pod)
+const networkPolicyToPod = makeRelation(
+  'networkpolicy-pod',
+  NetworkPolicy,
+  Pod,
+  (np, pod) => matchesLabels(np.spec.podSelector.matchLabels ?? {}, pod),
+  // An empty or matchExpressions-only podSelector selects every pod in the namespace.
+  // Without this flag the policy would merge all of their workloads into one group.
+  sharedEndpoint('source')
 );
 
 const roleBindingsToRole = makeRelation(
@@ -286,7 +316,8 @@ const roleBindingToServiceAccount = makeRelation(
   (binding, sa) =>
     binding.subjects.find(
       subject => subject.kind === 'ServiceAccount' && sa.metadata.name === subject.name
-    )
+    ),
+  sharedEndpoint('target')
 );
 
 const serviceAccountToDeployments = makeRelation(
@@ -295,7 +326,8 @@ const serviceAccountToDeployments = makeRelation(
   Deployment,
   (sa, deployment) =>
     (deployment.spec?.template?.spec?.serviceAccountName ?? 'default') === sa.metadata.name &&
-    deployment.metadata.namespace === sa.metadata.namespace
+    deployment.metadata.namespace === sa.metadata.namespace,
+  sharedEndpoint('source')
 );
 
 const serviceAccountToDaemonSets = makeRelation(
@@ -304,7 +336,8 @@ const serviceAccountToDaemonSets = makeRelation(
   DaemonSet,
   (sa, ds) =>
     (ds.spec?.template?.spec?.serviceAccountName ?? 'default') === sa.metadata.name &&
-    ds.metadata.namespace === sa.metadata.namespace
+    ds.metadata.namespace === sa.metadata.namespace,
+  sharedEndpoint('source')
 );
 
 const pvcToPods = makeRelation(
