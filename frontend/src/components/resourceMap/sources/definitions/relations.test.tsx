@@ -504,5 +504,10 @@ describe('useGetAllRelations', () => {
         node(new KubeObject({ kind: 'Deployment', metadata: { uid: 'd' } } as any))
       )
     ).toEqual({ nonGroupingSide: 'source' });
+    expect(relationById(result.current, 'pod-secret').edgeAttributes?.(node(matchingPod), node(configMap))).toEqual({ nonGroupingSide: 'target' });
+    expect(relationById(result.current, 'job-secret').edgeAttributes?.(node(policy), node(configMap))).toEqual({ nonGroupingSide: 'target' });
+    expect(relationById(result.current, 'sa-daemonset').edgeAttributes?.(node(serviceAccount), node(policy))).toEqual({ nonGroupingSide: 'source' });
+    expect(relationById(result.current, 'rolebinding-sa').edgeAttributes?.(node(policy), node(serviceAccount))).toEqual({ nonGroupingSide: 'target' });
+    expect(relationById(result.current, 'ingress-secret').edgeAttributes?.(node(policy), node(configMap))).toEqual({ nonGroupingSide: 'target' });
   });
 });

@@ -288,8 +288,12 @@ const ingressToService = makeRelation('ingress-service', Ingress, Service, (ingr
   )
 );
 
-const ingressToSecret = makeRelation('ingress-secret', Ingress, Secret, (ingress, secret) =>
-  ingress.spec.tls?.find(tls => tls.secretName === secret.metadata.name)
+const ingressToSecret = makeRelation(
+  'ingress-secret',
+  Ingress,
+  Secret,
+  (ingress, secret) => ingress.spec.tls?.find(tls => tls.secretName === secret.metadata.name),
+  sharedEndpoint('target')
 );
 
 const networkPolicyToPod = makeRelation(

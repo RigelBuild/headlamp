@@ -7,6 +7,7 @@ hooks {
     ["pre-push"] {
         steps {
             ["resource-map-tests"] = new Step {
+                glob = List("frontend/**")
                 check = "cd frontend && npm ci && npm test -- --run src/components/resourceMap/graph/graphGrouping.test.ts src/components/resourceMap/sources/definitions/relations.test.tsx"
             }
         }

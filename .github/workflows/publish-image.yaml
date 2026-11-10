@@ -139,6 +139,17 @@ jobs:
           VERSION: ${{ needs.resolve.outputs.version }}
           IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
         run: |
+          tag="${IMAGE_NAME}:v${VERSION}"
+          if existing="$(docker buildx imagetools inspect "$tag" 2>&1)"; then
+            digest="$(printf '%s\n' "$existing" | awk '/^Digest:/ {print $2; exit}')"
+            if [ "$digest" != "$IMAGE_DIGEST" ]; then
+              echo "::error::Release tag already points to a different digest" >&2
+              exit 1
+            fi
+          elif [[ "$existing" != *"not found"* && "$existing" != *"manifest unknown"* ]]; then
+            echo "::error::Could not inspect release tag" >&2
+            exit 1
+          fi
           docker buildx imagetools create --tag "${IMAGE_NAME}:v${VERSION}" "${IMAGE_NAME}@${IMAGE_DIGEST}"
           echo "Published ${IMAGE_NAME}@${IMAGE_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
       - name: Create GitHub Release
