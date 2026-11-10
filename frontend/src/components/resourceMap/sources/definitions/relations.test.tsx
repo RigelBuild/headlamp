@@ -468,4 +468,46 @@ describe('useGetAllRelations', () => {
     });
     expect(relation.edgeAttributes?.(node(pvc(['ReadWriteOnce'])), node(matchingPod))).toEqual({});
   });
+
+  it('flags shared ConfigMap, Secret, NetworkPolicy and ServiceAccount edges', () => {
+    vi.spyOn(CRD, 'useList').mockReturnValue({ items: null } as any);
+    const { result } = renderUseGetAllRelations();
+    const matchingPod = pod({ uid: 'pod', name: 'pod', namespace: 'namespace-a' }, {}, 'cluster-a');
+    const configMap = new ConfigMap(
+      { metadata: { uid: 'cm', name: 'cm', namespace: 'namespace-a' } } as any,
+      'cluster-a'
+    );
+    const policy = new KubeObject({
+      kind: 'NetworkPolicy',
+      metadata: { uid: 'np', name: 'np', namespace: 'namespace-a' },
+    } as any);
+    const serviceAccount = new KubeObject({
+      kind: 'ServiceAccount',
+      metadata: { uid: 'sa', name: 'sa', namespace: 'namespace-a' },
+    } as any);
+
+    expect(
+      relationById(result.current, 'pod-configmap').edgeAttributes?.(
+        node(matchingPod),
+        node(configMap)
+      )
+    ).toEqual({ nonGroupingSide: 'target' });
+    expect(
+      relationById(result.current, 'networkpolicy-pod').edgeAttributes?.(
+        node(policy),
+        node(matchingPod)
+      )
+    ).toEqual({ nonGroupingSide: 'source' });
+    expect(
+      relationById(result.current, 'sa-deployment').edgeAttributes?.(
+        node(serviceAccount),
+        node(new KubeObject({ kind: 'Deployment', metadata: { uid: 'd' } } as any))
+      )
+    ).toEqual({ nonGroupingSide: 'source' });
+    expect(relationById(result.current, 'pod-secret').edgeAttributes?.(node(matchingPod), node(configMap))).toEqual({ nonGroupingSide: 'target' });
+    expect(relationById(result.current, 'job-secret').edgeAttributes?.(node(policy), node(configMap))).toEqual({ nonGroupingSide: 'target' });
+    expect(relationById(result.current, 'sa-daemonset').edgeAttributes?.(node(serviceAccount), node(policy))).toEqual({ nonGroupingSide: 'source' });
+    expect(relationById(result.current, 'rolebinding-sa').edgeAttributes?.(node(policy), node(serviceAccount))).toEqual({ nonGroupingSide: 'target' });
+    expect(relationById(result.current, 'ingress-secret').edgeAttributes?.(node(policy), node(configMap))).toEqual({ nonGroupingSide: 'target' });
+  });
 });
