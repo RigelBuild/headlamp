@@ -609,6 +609,64 @@ describe('groupGraph', () => {
     expect((group.nodes ?? []).map(n => n.id).sort()).toEqual(['pod-solo', 'pvc-a', 'pvc-b']);
     expect((group.edges ?? []).map(e => e.id).sort()).toEqual(['e-pod-pvc-a', 'e-pod-pvc-b']);
   });
+
+  it('does not bridge workloads through a namespace-wide NetworkPolicy or a shared ConfigMap', () => {
+    // A default-deny policy selects every pod in the namespace, and one ConfigMap is mounted
+    // by both pods. Each shared node is flagged on its side of every edge, so neither one
+    // merges the two workloads. The Service only selects pod-a and must stay with it.
+    const policy: GraphNode = {
+      id: 'np-default-deny',
+      kubeObject: { kind: 'NetworkPolicy' } as any,
+    };
+    const configMap: GraphNode = {
+      id: 'cm-shared',
+      kubeObject: { kind: 'ConfigMap', metadata: { name: 'cm-shared' } } as any,
+    };
+    const deploymentA: GraphNode = { id: 'deploy-a', kubeObject: { kind: 'Deployment' } as any };
+    const podA: GraphNode = { id: 'pod-a', kubeObject: { kind: 'Pod' } as any };
+    const deploymentB: GraphNode = { id: 'deploy-b', kubeObject: { kind: 'Deployment' } as any };
+    const podB: GraphNode = { id: 'pod-b', kubeObject: { kind: 'Pod' } as any };
+    const serviceA: GraphNode = { id: 'svc-a', kubeObject: { kind: 'Service' } as any };
+
+    const groupedGraph = groupGraph(
+      [policy, configMap, deploymentA, podA, deploymentB, podB, serviceA],
+      [
+        { id: 'e-dep-a', source: 'deploy-a', target: 'pod-a' },
+        { id: 'e-dep-b', source: 'deploy-b', target: 'pod-b' },
+        { id: 'e-svc-a', source: 'svc-a', target: 'pod-a' },
+        { id: 'e-np-a', source: 'np-default-deny', target: 'pod-a', nonGroupingSide: 'source' },
+        { id: 'e-np-b', source: 'np-default-deny', target: 'pod-b', nonGroupingSide: 'source' },
+        { id: 'e-cm-a', source: 'pod-a', target: 'cm-shared', nonGroupingSide: 'target' },
+        { id: 'e-cm-b', source: 'pod-b', target: 'cm-shared', nonGroupingSide: 'target' },
+      ],
+      { namespaces: [], k8sNodes: [] }
+    );
+
+    const connectedGroups = (groupedGraph.nodes ?? []).filter(
+      node => node.id.startsWith('group-') && (node.edges?.length ?? 0) > 0
+    );
+    expect(connectedGroups).toHaveLength(2);
+
+    const idsOf = (group: GraphNode) => new Set((group.nodes ?? []).map(n => n.id));
+    const groupA = connectedGroups.find(g => idsOf(g).has('deploy-a'));
+    const groupB = connectedGroups.find(g => idsOf(g).has('deploy-b'));
+    expect(groupA).toBeDefined();
+    expect(groupB).toBeDefined();
+
+    expect(['deploy-a', 'pod-a', 'svc-a'].every(id => idsOf(groupA!).has(id))).toBe(true);
+    expect(idsOf(groupA!).has('deploy-b')).toBe(false);
+    expect(idsOf(groupA!).has('pod-b')).toBe(false);
+    expect(['deploy-b', 'pod-b'].every(id => idsOf(groupB!).has(id))).toBe(true);
+    expect(idsOf(groupB!).has('svc-a')).toBe(false);
+
+    // The policy and the ConfigMap are cloned into each group, so neither keeps its original ID.
+    expect(groupedGraph.nodes?.some(n => n.id === 'np-default-deny')).toBe(false);
+    expect(groupedGraph.nodes?.some(n => n.id === 'cm-shared')).toBe(false);
+    connectedGroups.forEach(group => {
+      expect(group.nodes?.some(n => n.kubeObject?.kind === 'NetworkPolicy')).toBe(true);
+      expect(group.nodes?.some(n => n.kubeObject?.kind === 'ConfigMap')).toBe(true);
+    });
+  });
 });
 
 describe('collapseGraph', () => {
