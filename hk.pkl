@@ -1,0 +1,14 @@
+// Git hooks managed by hk (https://hk.jdx.dev).
+amends "package://github.com/jdx/hk/releases/download/v2.11.1/hk@2.11.1#/Config.pkl"
+
+default_branch = "rigel-release"
+
+hooks {
+    ["pre-push"] {
+        steps {
+            ["resource-map-tests"] = new Step {
+                check = "cd frontend && npm ci && npm test -- --run src/components/resourceMap/graph/graphGrouping.test.ts src/components/resourceMap/sources/definitions/relations.test.tsx"
+            }
+        }
+    }
+}
