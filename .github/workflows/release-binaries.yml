@@ -1,0 +1,166 @@
+name: release-binaries
+
+# Builds the headlamp-server binaries for the platforms hosts consume and
+# publishes them as GitHub Release assets. The fork flake in flake.nix fetches
+# these assets by hash, so no host compiles headlamp at switch time.
+
+'on':
+  push:
+    tags:
+      - 'v*.*.*-rigel.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to rehearse, such as 0.45.0-rigel.1
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Require release ancestry
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          git fetch origin rigel-release:refs/remotes/origin/rigel-release
+          commit="$(git rev-parse --verify "${REF}^{commit}")"
+          git merge-base --is-ancestor "$commit" origin/rigel-release || {
+            echo '::error::Ref is not reachable from rigel-release' >&2
+            exit 1
+          }
+      - name: Resolve and validate version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            version="${REF_NAME#v}"
+          else
+            version="$INPUT_VERSION"
+          fi
+          upstream="$(node -p "require('./app/package.json').version")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rigel\.[0-9]+$ ]] || [[ "$version" != "$upstream"-rigel.* ]]; then
+            echo '::error::Version must match app/package.json and use the -rigel.N suffix' >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build-frontend:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: '22'
+      - name: Build frontend
+        run: |
+          cd frontend && npm ci && REACT_APP_HEADLAMP_SIDEBAR_DEFAULT_OPEN=false npm run build
+      - name: Upload frontend build
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: frontend-build
+          path: frontend/build
+          if-no-files-found: error
+
+  build-binaries:
+    needs: [resolve, build-frontend]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+            runs_on: macos-latest
+          - goos: linux
+            goarch: amd64
+            runs_on: ubuntu-latest
+          - goos: linux
+            goarch: arm64
+            runs_on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Setup Go
+        uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
+        with:
+          go-version-file: backend/go.mod
+      - name: Download frontend build
+        uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
+        with:
+          name: frontend-build
+          path: frontend/build
+      - name: Stage embedded SPA
+        run: |
+          mkdir -p backend/pkg/spa/static
+          cp -R frontend/build/* backend/pkg/spa/static/
+      - name: Build headlamp-server
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="headlamp-server-v${VERSION}-${GOOS}-${GOARCH}"
+          mkdir -p dist/"$name"
+          cd backend
+          go build -trimpath -tags embed \
+            -ldflags="-s -w -X github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig.Version=${VERSION}" \
+            -o ../dist/"$name"/headlamp-server ./cmd
+          cd ../dist
+          tar -C "$name" -czf "$name.tar.gz" headlamp-server
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Upload binary
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: headlamp-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  publish-release:
+    if: github.event_name == 'push'
+    needs: [resolve, build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Download binaries
+        uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
+        with:
+          pattern: headlamp-*
+          path: release
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $TAG already exists; refreshing assets"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi
+          gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
