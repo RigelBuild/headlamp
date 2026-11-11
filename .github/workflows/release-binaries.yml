@@ -104,6 +104,9 @@ jobs:
         uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
         with:
           go-version-file: backend/go.mod
+      - name: Install GNU tar (darwin)
+        if: matrix.goos == 'darwin'
+        run: brew install gnu-tar
       - name: Download frontend build
         uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
         with:
@@ -128,7 +131,10 @@ jobs:
             -ldflags="-s -w -X github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig.Version=${VERSION}" \
             -o ../dist/"$name"/headlamp-server ./cmd
           cd ../dist
-          tar -C "$name" -czf "$name.tar.gz" headlamp-server
+          # Fixed sort, owner and mtime, and gzip -n, so re-runs produce identical bytes.
+          tar_bin="$(command -v gtar || command -v tar)"
+          "$tar_bin" --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            -C "$name" -cf - headlamp-server | gzip -n > "$name.tar.gz"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - name: Upload binary
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
@@ -158,9 +164,16 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "GitHub Release $TAG already exists; refreshing assets"
-          else
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
           fi
-          gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          # Assets are immutable: never clobber. Refuse any name that already exists.
+          existing="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for f in release/*; do
+            name="$(basename "$f")"
+            if grep -qxF "$name" <<< "$existing"; then
+              echo "::error::asset $name already exists on $TAG; refusing to overwrite" >&2
+              exit 1
+            fi
+            gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
+          done
