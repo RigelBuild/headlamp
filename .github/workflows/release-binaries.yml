@@ -1,8 +1,8 @@
 name: release-binaries
 
 # Builds the headlamp-server binaries for the platforms hosts consume and
-# publishes them as GitHub Release assets. The fork flake in flake.nix fetches
-# these assets by hash, so no host compiles headlamp at switch time.
+# publishes them as GitHub Release assets. Hash-pinned consumers fetch these
+# assets, so no host compiles headlamp at switch time.
 
 'on':
   push:
@@ -167,13 +167,20 @@ jobs:
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
           fi
-          # Assets are immutable: never clobber. Refuse any name that already exists.
+          # Assets are immutable: never clobber. An existing asset is skipped when its
+          # sha256 matches the published digest, and fails the run when it differs.
           existing="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
           for f in release/*; do
             name="$(basename "$f")"
             if grep -qxF "$name" <<< "$existing"; then
-              echo "::error::asset $name already exists on $TAG; refusing to overwrite" >&2
-              exit 1
+              published="$(gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name" --output - | shasum -a 256 | cut -d' ' -f1)"
+              local_sum="$(shasum -a 256 "$f" | cut -d' ' -f1)"
+              if [ "$published" != "$local_sum" ]; then
+                echo "::error::asset $name exists on $TAG with a different sha256; refusing to overwrite" >&2
+                exit 1
+              fi
+              echo "asset $name already published with matching sha256; skipping"
+              continue
             fi
             gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
           done
