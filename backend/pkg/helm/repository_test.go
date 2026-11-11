@@ -122,13 +122,13 @@ func checkRepoExists(t *testing.T, helmHandler *helm.Handler, repoName string) b
 	return false
 }
 
-//nolint:unparam
+//nolint:unparam // repoName and repoURL parameters always receive constants across existing tests.
 func testAddRepo(t *testing.T, helmHandler *helm.Handler, repoName, repoURL string) {
 	t.Helper()
 
 	addRepo := helm.AddUpdateRepoRequest{
-		Name: "headlamp_test_repo",
-		URL:  "https://kubernetes-sigs.github.io/headlamp/",
+		Name: repoName,
+		URL:  repoURL,
 	}
 
 	addRepoRequest, err := http.NewRequestWithContext(context.Background(), "POST",
@@ -140,7 +140,7 @@ func testAddRepo(t *testing.T, helmHandler *helm.Handler, repoName, repoURL stri
 	helmHandler.AddRepo(rr, addRepoRequest)
 	assert.Equal(t, http.StatusOK, rr.Code)
 
-	assert.True(t, checkRepoExists(t, helmHandler, "headlamp_test_repo"))
+	assert.True(t, checkRepoExists(t, helmHandler, repoName))
 }
 
 // TestAddRepositoryToHelm.
@@ -185,6 +185,20 @@ func TestAddRepository(t *testing.T) {
 		helmHandler.AddRepo(rr, req)
 		assert.Equal(t, http.StatusBadRequest, rr.Code)
 		assert.Contains(t, rr.Body.String(), "url is required")
+	})
+
+	t.Run("name_with_path_traversal_is_rejected", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST",
+			"/clusters/minikube/helm/repositories/charts",
+			bytes.NewBufferString(`{"name":"../../../escaped","url":"https://kubernetes-sigs.github.io/headlamp/"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.AddRepo(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "path separators")
+
+		assert.False(t, checkRepoExists(t, helmHandler, "../../../escaped"))
 	})
 }
 
@@ -258,6 +272,18 @@ func TestUpdateRepo(t *testing.T) {
 		helmHandler.UpdateRepository(rr, req)
 		assert.Equal(t, http.StatusBadRequest, rr.Code)
 		assert.Contains(t, rr.Body.String(), "url is required")
+	})
+
+	t.Run("name_with_path_traversal_is_rejected", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "PUT",
+			"/clusters/minikube/helm/repositories",
+			bytes.NewBufferString(`{"name":"../../../escaped","url":"https://kubernetes-sigs.github.io/headlamp/"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.UpdateRepository(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "path separators")
 	})
 }
 
@@ -598,4 +624,41 @@ func TestCreateFileIfNotThere(t *testing.T) {
 		_, statErr := os.Stat(customSettings.RepositoryConfig)
 		assert.NoError(t, statErr, "repository config file should have been created by createFileIfNotThere")
 	})
+}
+
+// TestAddUpdateRepoRequestValidateRejectsPathSeparators covers the regression for a repository
+// name such as "../../../escaped", which DownloadIndexFile would otherwise turn into a cache
+// index file path outside the Helm repository cache directory.
+func TestAddUpdateRepoRequestValidateRejectsPathSeparators(t *testing.T) {
+	tests := []struct {
+		name      string
+		repoName  string
+		expectErr bool
+	}{
+		{name: "parent_dir_prefix", repoName: "../x", expectErr: true},
+		{name: "forward_slash", repoName: "a/b", expectErr: true},
+		{name: "backslash", repoName: `a\b`, expectErr: true},
+		{name: "dot_dot_only", repoName: "..", expectErr: true},
+		{name: "dot_only_is_allowed", repoName: ".", expectErr: false},
+		{name: "leading_trailing_spaces_allowed", repoName: "  bitnami  ", expectErr: false},
+		{name: "normal_name_allowed", repoName: "bitnami", expectErr: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := helm.AddUpdateRepoRequest{
+				Name: tt.repoName,
+				URL:  "https://kubernetes-sigs.github.io/headlamp/",
+			}
+
+			err := req.Validate()
+
+			if tt.expectErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "path separators")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

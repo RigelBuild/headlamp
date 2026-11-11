@@ -22,6 +22,7 @@ import { ApiError } from './ApiError';
 import { clusterFetch } from './fetch';
 import {
   DEFAULT_LIST_LIMIT,
+  isWatchedListStillRequested,
   kubeObjectListQuery,
   ListResponse,
   makeListRequests,
@@ -235,6 +236,62 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+
+describe('isWatchedListStillRequested', () => {
+  // Regression test for 9542b5cb5: an empty-string namespace means "all namespaces"
+  // for a namespaced resource and is a valid, meaningful value — but it is falsy, so
+  // a naive truthiness check (`!watching.namespace`) treats it the same as "no
+  // namespace at all" and incorrectly drops the watch entry. It must never get
+  // "cleaned up" just because it's an empty string.
+  it('should keep a watch entry with an empty-string namespace when still requested', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'default', namespaces: [''] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(true);
+  });
+
+  it('should drop a watch entry whose cluster is no longer requested', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'other-cluster', namespaces: [''] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(false);
+  });
+
+  it('should keep a watch entry with no namespace for a non-namespaced resource', () => {
+    const watching = { cluster: 'default', namespace: undefined };
+    const requests = [{ cluster: 'default', namespaces: undefined }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(true);
+  });
+
+  // A request with no namespace filter is served by kubeObjectListQuery with its
+  // default namespace of '', so the resulting watch entry carries '' rather than
+  // undefined. It still matches that request.
+  it('should keep a watch entry with an empty-string namespace when the request has no namespaces', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'default', namespaces: undefined }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(true);
+  });
+
+  it('should drop a watch entry whose namespace is no longer requested', () => {
+    const watching = { cluster: 'default', namespace: 'gone' };
+    const requests = [{ cluster: 'default', namespaces: ['kept'] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(false);
+  });
+
+  // The mirror image of the 9542b5cb5 regression: '' must not be read as "matches
+  // anything" either. Without this case, '' is never checked against a non-empty
+  // namespace list anywhere in the suite, so an implementation short-circuiting ''
+  // to a match would pass every other test here.
+  it('should drop a watch entry with an empty-string namespace when a specific namespace is requested', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'default', namespaces: ['default'] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(false);
+  });
+});
 
 describe('useWatchKubeObjectLists', () => {
   beforeEach(() => {
@@ -990,6 +1047,126 @@ describe('useKubeObjectList', () => {
 
     expect(mockClusterFetch.mock.calls[0][0]).toBe('api/v1/namespaces/a/pods?limit=500');
     expect(mockClusterFetch.mock.calls[1][0]).toBe('api/v1/namespaces/b/pods?limit=500');
+  });
+
+  it('should keep every namespace in clusterResults when a cluster has several', async () => {
+    mockClusterFetch
+      .mockResolvedValueOnce({
+        json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-a', '1')] })),
+      } as Response)
+      .mockResolvedValueOnce({
+        json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-b', '1')] })),
+      } as Response);
+
+    const { result } = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: mockClass,
+          requests: [{ cluster: 'default', namespaces: ['a', 'b'] }],
+        }),
+      {
+        wrapper: queryClientWrapper(new QueryClient()),
+      }
+    );
+
+    await waitFor(() => expect(result.current.items).toHaveLength(2));
+
+    const names = (items: any[] | null | undefined) =>
+      items?.map(item => item.jsonData.metadata.name);
+    expect(names(result.current.items)).toEqual(['pod-a', 'pod-b']);
+    expect(names(result.current.clusterResults?.default.items)).toEqual(['pod-a', 'pod-b']);
+    expect(result.current.clusterResults?.default.isSuccess).toBe(true);
+    expect(result.current.clusterResults?.default.status).toBe('success');
+  });
+
+  it('should report a namespace that failed in clusterResults', async () => {
+    const error = new ApiError('Forbidden', { status: 403 });
+    mockClusterFetch
+      .mockResolvedValueOnce({
+        json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-a', '1')] })),
+      } as Response)
+      .mockRejectedValueOnce(error);
+
+    const { result } = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: mockClass,
+          requests: [{ cluster: 'default', namespaces: ['a', 'b'] }],
+        }),
+      {
+        wrapper: queryClientWrapper(new QueryClient()),
+      }
+    );
+
+    await waitFor(() => expect(result.current.clusterResults?.default.isError).toBe(true));
+
+    const clusterResult = result.current.clusterResults!.default;
+    expect(clusterResult.items?.map(item => item.jsonData.metadata.name)).toEqual(['pod-a']);
+    expect(clusterResult.errors).toEqual([error]);
+    expect(clusterResult.isSuccess).toBe(false);
+    expect(clusterResult.status).toBe('error');
+  });
+
+  it('should report a namespace that is still loading in clusterResults', async () => {
+    const namespaceB = deferred<Response>();
+    mockClusterFetch
+      .mockResolvedValueOnce({
+        json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-a', '1')] })),
+      } as Response)
+      .mockReturnValueOnce(namespaceB.promise);
+
+    const { result } = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: mockClass,
+          requests: [{ cluster: 'default', namespaces: ['a', 'b'] }],
+        }),
+      {
+        wrapper: queryClientWrapper(new QueryClient()),
+      }
+    );
+
+    await waitFor(() => expect(result.current.clusterResults?.default.items).toHaveLength(1));
+    expect(result.current.clusterResults?.default.isLoading).toBe(true);
+    expect(result.current.clusterResults?.default.isSuccess).toBe(false);
+    expect(result.current.clusterResults?.default.status).toBe('pending');
+
+    namespaceB.resolve({
+      json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-b', '1')] })),
+    } as Response);
+
+    await waitFor(() => expect(result.current.clusterResults?.default.items).toHaveLength(2));
+    expect(result.current.clusterResults?.default.isLoading).toBe(false);
+    expect(result.current.clusterResults?.default.status).toBe('success');
+  });
+
+  it('should leave a cluster out of clusterResults until one of its namespaces has data', async () => {
+    const namespaceA = deferred<Response>();
+    const namespaceB = deferred<Response>();
+    mockClusterFetch
+      .mockReturnValueOnce(namespaceA.promise)
+      .mockReturnValueOnce(namespaceB.promise);
+
+    const { result } = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: mockClass,
+          requests: [{ cluster: 'default', namespaces: ['a', 'b'] }],
+        }),
+      {
+        wrapper: queryClientWrapper(new QueryClient()),
+      }
+    );
+
+    // Home shows a cluster without an entry as still loading.
+    await waitFor(() => expect(mockClusterFetch).toHaveBeenCalledTimes(2));
+    expect(result.current.clusterResults?.default).toBeUndefined();
+
+    namespaceA.resolve({
+      json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-a', '1')] })),
+    } as Response);
+
+    await waitFor(() => expect(result.current.clusterResults?.default.items).toHaveLength(1));
   });
 
   it('should not issue more initial namespace requests than the opt-in limit', async () => {

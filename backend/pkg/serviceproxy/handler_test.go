@@ -1,4 +1,4 @@
-package serviceproxy //nolint
+package serviceproxy //nolint:testpackage // Tests exercise unexported service proxy internals.
 
 import (
 	"context"
@@ -19,7 +19,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 )
 
-//nolint:funlen
+//nolint:funlen // Table-driven test function covering service proxy request dispatching.
 func TestHandleServiceProxy(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -261,6 +261,8 @@ func TestRequestHandlerSendsNoCacheHeaders(t *testing.T) {
 	assert.Equal(t, "no-cache", resp.Header.Get("Pragma"))
 	assert.Equal(t, "0", resp.Header.Get("X-Accel-Expires"))
 	assert.NotEmpty(t, resp.Header.Get("Expires"))
+	assert.Equal(t, "sandbox", resp.Header.Get("Content-Security-Policy"))
+	assert.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
 }
 
 // createMockService creates a mock Kubernetes service for testing.
@@ -281,7 +283,7 @@ func createMockService(namespace, name string) *corev1.Service {
 	}
 }
 
-//nolint:funlen
+//nolint:funlen // Long test function containing multiple getAuthToken test scenarios.
 func TestGetAuthToken(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -398,7 +400,7 @@ func TestGetAuthToken(t *testing.T) {
 			expectedToken: "spaced-token",
 			expectError:   false,
 		},
-		{ //nolint:gosec
+		{ //nolint:gosec // Hardcoded mock bearer token string used strictly for unit testing.
 			name:        "valid token with Bearer prefix",
 			clusterName: "test-cluster",
 			setupRequest: func() *http.Request {
@@ -443,7 +445,7 @@ func TestGetAuthToken(t *testing.T) {
 	}
 }
 
-//nolint:funlen
+//nolint:funlen // Long test function covering multiple GetServiceFromCluster error scenarios.
 func TestGetServiceFromCluster(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -542,7 +544,7 @@ func TestGetServiceFromCluster(t *testing.T) {
 	}
 }
 
-//nolint:funlen
+//nolint:funlen // Table-driven test function covering request URI parsing edge cases.
 func TestParseInfoFromRequest(t *testing.T) {
 	tests := []struct {
 		name                string

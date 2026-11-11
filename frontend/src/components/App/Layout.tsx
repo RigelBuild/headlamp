@@ -33,12 +33,17 @@ import { useCluster, useClustersConf, useSelectedClusters } from '../../lib/k8s'
 import { request } from '../../lib/k8s/api/v1/clusterRequests';
 import { Cluster } from '../../lib/k8s/cluster';
 import { getSavedNamespaces } from '../../lib/storage';
+import { getUserSelectedThemeName } from '../../lib/themes';
 import { setConfig } from '../../redux/configSlice';
 import { ConfigState } from '../../redux/configSlice';
 import { setNamespaceFilter } from '../../redux/filterSlice';
 import { useTypedSelector } from '../../redux/hooks';
 import store from '../../redux/stores/store';
 import { useUIPanelsGroupedBySide } from '../../redux/uiSlice';
+import { setAdminSettings } from '../../settings/adminSettingsSlice';
+import { useClusterDefinedSettings } from '../../settings/fetchClusterSettings';
+import { parseAdminSettings } from '../../settings/parseAdminSettings';
+import { useSetting } from '../../settings/useAdminSettings';
 import { fetchStatelessClusterKubeConfigs, isEqualClusterConfigs } from '../../stateless/';
 import { ActivitiesRenderer } from '../activity/Activity';
 import { ErrorPage, Loader } from '../common';
@@ -47,15 +52,17 @@ import AlertNotification from '../common/AlertNotification';
 import DetailsDrawer from '../common/Resource/DetailsDrawer';
 import Sidebar, { NavigationTabs } from '../Sidebar';
 import AllowedNamespacesSelectorGate from './AllowedNamespacesSelectorGate';
+import ResourceShortcuts from './ResourceShortcuts';
 import RouteSwitcher from './RouteSwitcher';
 import ShortcutsSettings from './Settings/ShortcutsSettings';
-import { applyBackendThemeConfig } from './themeSlice';
+import { applyAdminTheme, applyBackendThemeConfig, useAppThemes } from './themeSlice';
 import TopBar from './TopBar';
 import VersionDialog from './VersionDialog';
 
 export interface LayoutProps {}
 
 const CLUSTER_FETCH_INTERVAL = 10 * 1000; // ms
+const CONFIG_FETCH_TIMEOUT_MS = 30 * 1000;
 
 function ClusterNotFoundPopup({ cluster }: { cluster?: string }) {
   const problemCluster = cluster || getCluster();
@@ -140,7 +147,7 @@ const fetchConfig = (dispatch: Dispatch<UnknownAction>) => {
   const clusters = store.getState().config.clusters;
   const statelessClusters = store.getState().config.statelessClusters;
 
-  return request('/config', {}, false, false).then(config => {
+  return request('/config', { timeout: CONFIG_FETCH_TIMEOUT_MS }, false, false).then(config => {
     const clustersToConfig: ConfigState['clusters'] = {};
     config?.clusters.forEach((cluster: Cluster) => {
       if (cluster.meta_data?.extensions?.headlamp_info?.customName) {
@@ -149,7 +156,11 @@ const fetchConfig = (dispatch: Dispatch<UnknownAction>) => {
       clustersToConfig[cluster.name] = cluster;
     });
 
-    const configToStore = { ...config, clusters: clustersToConfig };
+    const configToStore = {
+      ...config,
+      clusters: clustersToConfig,
+      oidcAutoLogin: config.oidcAutoLogin,
+    };
 
     if (clusters === null) {
       dispatch(setConfig(configToStore));
@@ -173,16 +184,17 @@ const fetchConfig = (dispatch: Dispatch<UnknownAction>) => {
       }
     }
 
-    // Apply backend theme configuration if provided
-    if (config?.defaultLightTheme || config?.defaultDarkTheme || config?.forceTheme) {
-      dispatch(
-        applyBackendThemeConfig({
-          defaultLightTheme: config.defaultLightTheme,
-          defaultDarkTheme: config.defaultDarkTheme,
-          forceTheme: config.forceTheme,
-        })
-      );
+    if (config?.adminSettings) {
+      dispatch(setAdminSettings(parseAdminSettings(config.adminSettings)));
     }
+
+    dispatch(
+      applyBackendThemeConfig({
+        defaultLightTheme: config?.defaultLightTheme,
+        defaultDarkTheme: config?.defaultDarkTheme,
+        forceTheme: config?.forceTheme,
+      })
+    );
 
     /**
      * Fetches the stateless cluster config from the indexDB and then sends the backend to parse it
@@ -200,11 +212,38 @@ const disableBackendLoader = true;
 
 export default function Layout({}: LayoutProps) {
   const arePluginsLoaded = useTypedSelector(state => state.plugins.loaded);
+  const isThemeConfigReady = useTypedSelector(state => state.theme.backendConfigReady);
   const dispatch = useDispatch();
   const clusters = useTypedSelector(state => state.config.clusters);
   const isFullWidth = useTypedSelector(state => state.ui.isFullWidth);
   const { t } = useTranslation();
   const allClusters = useClustersConf();
+  const location = useLocation();
+
+  useClusterDefinedSettings();
+
+  // Bridge the admin theme to the active theme state. CLI forceTheme has
+  // precedence and is applied via applyBackendThemeConfig. A restricted admin
+  // theme always applies; otherwise the user's own pick wins and the admin
+  // theme is only the default.
+  const adminTheme = useSetting<string>('theme');
+  const appThemes = useAppThemes();
+  const forceTheme = useTypedSelector(state => state.config.forceTheme);
+  useEffect(() => {
+    if (forceTheme) {
+      return;
+    }
+    const restricted = adminTheme.disabled || adminTheme.hidden;
+    const target = restricted
+      ? adminTheme.value
+      : getUserSelectedThemeName(appThemes) ?? adminTheme.value;
+    if (target) {
+      dispatch(applyAdminTheme(target));
+    }
+    // appThemes is read only for the user's pick; theme registration alone must
+    // not re-apply the admin theme over what the user is looking at.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adminTheme.value, adminTheme.disabled, adminTheme.hidden, forceTheme, dispatch]);
 
   /** This fetches the cluster config from the backend and updates the redux store on an interval.
    * When stateless clusters are enabled, it also fetches the stateless cluster config from the
@@ -218,6 +257,7 @@ export default function Layout({}: LayoutProps) {
   } = useQuery({
     queryKey: ['cluster-fetch'],
     queryFn: () => fetchConfig(dispatch),
+    retry: false,
     refetchInterval: disableBackendLoader
       ? CLUSTER_FETCH_INTERVAL
       : query => (query.state.status === 'error' ? false : CLUSTER_FETCH_INTERVAL),
@@ -229,6 +269,12 @@ export default function Layout({}: LayoutProps) {
     document.body.removeAttribute('style');
   }, []);
 
+  useEffect(() => {
+    if (error && !isThemeConfigReady) {
+      dispatch(applyBackendThemeConfig({}));
+    }
+  }, [dispatch, error, isThemeConfigReady]);
+
   const cluster = useCluster();
   useEffect(() => {
     if (cluster) {
@@ -238,7 +284,7 @@ export default function Layout({}: LayoutProps) {
   }, [cluster, dispatch]);
 
   const selectedClusters = useSelectedClusters();
-  const { pathname } = useLocation();
+  const { pathname } = location;
   const configuredClusters = pathname.startsWith('/project/') ? Object.keys(allClusters || {}) : [];
   const clustersToResolve = [
     ...new Set([...configuredClusters, cluster || '', ...selectedClusters].filter(Boolean)),
@@ -255,6 +301,10 @@ export default function Layout({}: LayoutProps) {
   const MAXIMUM_NUM_ALERTS = 2;
 
   const panels = useUIPanelsGroupedBySide();
+
+  if (!arePluginsLoaded || !isThemeConfigReady) {
+    return <Loader title={t('Loading')} color="inherit" style={{ color: 'GrayText' }} />;
+  }
 
   if (!disableBackendLoader) {
     if (error && !config) {
@@ -312,6 +362,7 @@ export default function Layout({}: LayoutProps) {
       </Link>
       <VersionDialog />
       <ShortcutsSettings />
+      <ResourceShortcuts />
       <CssBaseline enableColorScheme />
       <ActionsNotifier />
       <Box sx={{ display: 'flex', height: '100dvh' }}>
@@ -359,18 +410,8 @@ export default function Layout({}: LayoutProps) {
                 <Div />
                 <Container {...containerProps} sx={{ height: '100%' }}>
                   <NavigationTabs />
-                  {arePluginsLoaded &&
-                    (clustersToResolve.length > 0 ? (
-                      <AllowedNamespacesSelectorGate clusters={clustersToResolve}>
-                        <RouteSwitcher
-                          requiresToken={() => {
-                            const clusterName = getCluster() || '';
-                            const cluster = clusters ? clusters[clusterName] : undefined;
-                            return cluster?.useToken === undefined || cluster?.useToken;
-                          }}
-                        />
-                      </AllowedNamespacesSelectorGate>
-                    ) : (
+                  {clustersToResolve.length > 0 ? (
+                    <AllowedNamespacesSelectorGate clusters={clustersToResolve}>
                       <RouteSwitcher
                         requiresToken={() => {
                           const clusterName = getCluster() || '';
@@ -378,7 +419,16 @@ export default function Layout({}: LayoutProps) {
                           return cluster?.useToken === undefined || cluster?.useToken;
                         }}
                       />
-                    ))}
+                    </AllowedNamespacesSelectorGate>
+                  ) : (
+                    <RouteSwitcher
+                      requiresToken={() => {
+                        const clusterName = getCluster() || '';
+                        const cluster = clusters ? clusters[clusterName] : undefined;
+                        return cluster?.useToken === undefined || cluster?.useToken;
+                      }}
+                    />
+                  )}
                 </Container>
               </Box>
             </Main>

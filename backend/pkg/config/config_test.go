@@ -146,6 +146,13 @@ func TestParseBasic(t *testing.T) {
 	}
 }
 
+func TestParseOidcAutoLogin(t *testing.T) {
+	conf, err := config.Parse([]string{"go run ./cmd", "--oidc-auto-login=true"})
+	require.NoError(t, err)
+	require.NotNil(t, conf)
+	assert.True(t, conf.OidcAutoLogin)
+}
+
 func TestParseAppName(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -245,6 +252,16 @@ var ParseWithEnvTests = []struct {
 		},
 		verify: func(t *testing.T, conf *config.Config) {
 			assert.Equal(t, "superSecretBotsStayAwayPlease", conf.OidcClientSecret)
+		},
+	},
+	{
+		name: "oidc_auto_login_from_env",
+		args: []string{"go run ./cmd"},
+		env: map[string]string{
+			"HEADLAMP_CONFIG_OIDC_AUTO_LOGIN": "true",
+		},
+		verify: func(t *testing.T, conf *config.Config) {
+			assert.Equal(t, true, conf.OidcAutoLogin)
 		},
 	},
 	{
@@ -464,6 +481,13 @@ var parseFlagTests = []parseFlagTest{
 		},
 	},
 	{
+		name: "oidc_skip_logout_flag",
+		args: []string{"go run ./cmd", "--oidc-skip-logout"},
+		verify: func(t *testing.T, conf *config.Config) {
+			assert.Equal(t, true, conf.OidcSkipLogout)
+		},
+	},
+	{
 		name: "oidc_ca_file_flag",
 		args: []string{
 			"go run ./cmd",
@@ -511,6 +535,16 @@ var parseFlagTests = []parseFlagTest{
 
 func TestParseFlags(t *testing.T) {
 	runParseFlagTests(t, parseFlagTests)
+}
+
+func TestParseSettingsFlag(t *testing.T) {
+	conf, err := config.Parse([]string{"-in-cluster", "-settings", "/etc/headlamp/settings.json"})
+	require.NoError(t, err)
+	assert.Equal(t, "/etc/headlamp/settings.json", conf.SettingsPath)
+
+	conf, err = config.Parse([]string{"-in-cluster"})
+	require.NoError(t, err)
+	assert.Empty(t, conf.SettingsPath)
 }
 
 func runParseFlagTests(t *testing.T, tests []parseFlagTest) {
@@ -841,6 +875,14 @@ func TestOIDCTLSEnvironmentVariables(t *testing.T) {
 	}
 }
 
+func TestOIDCSkipLogoutEnvironmentVariable(t *testing.T) {
+	t.Setenv("HEADLAMP_CONFIG_OIDC_SKIP_LOGOUT", "true")
+
+	conf, err := config.Parse([]string{"go run ./cmd"})
+	require.NoError(t, err)
+	assert.True(t, conf.OidcSkipLogout)
+}
+
 var applyMeDefaultsTests = []struct {
 	name             string
 	usernamePath     string
@@ -921,6 +963,20 @@ func TestApplyMeDefaults(t *testing.T) {
 			assert.Equal(t, tt.wantUserInfoURL, gotUserInfo)
 		})
 	}
+}
+
+func TestApplyMeDefaults_TrimsWhitespace(t *testing.T) {
+	gotUsername, gotEmail, gotGroups, gotUserInfo := config.ApplyMeDefaults(
+		"  user.name  ",
+		"  user.email  ",
+		"  user.groups  ",
+		"  /oauth2/userinfo  ",
+	)
+
+	assert.Equal(t, "user.name", gotUsername)
+	assert.Equal(t, "user.email", gotEmail)
+	assert.Equal(t, "user.groups", gotGroups)
+	assert.Equal(t, "/oauth2/userinfo", gotUserInfo)
 }
 
 func TestValidateSessionTTL(t *testing.T) {

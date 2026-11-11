@@ -1,0 +1,99 @@
+package headlampconfig
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"time"
+
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/config"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/telemetry"
+)
+
+// WebSocketMultiplexer handles client websocket connections. Implemented in cmd to avoid circular import.
+type WebSocketMultiplexer interface {
+	HandleClientWebSocket(http.ResponseWriter, *http.Request)
+}
+
+// HeadlampConfig holds full server config. Lives here so packages (e.g. k8cache) can import without cmd.
+type HeadlampConfig struct {
+	*HeadlampCFG
+	OidcAutoLogin             bool
+	OidcClientID              string
+	OidcValidatorClientID     string
+	OidcClientSecret          string
+	OidcIdpIssuerURL          string
+	OidcCallbackURL           string
+	OidcValidatorIdpIssuerURL string
+	OidcUseAccessToken        bool
+	OidcSkipTLSVerify         bool
+	OidcCACert                string
+	OidcUsePKCE               bool
+	OidcSkipLogout            bool
+	OidcScopes                []string
+	Cache                     cache.Cache[interface{}]
+	Multiplexer               WebSocketMultiplexer
+	TelemetryConfig           config.Config
+	TelemetryHandler          *telemetry.RequestHandler
+	MeUsernamePaths           string
+	MeEmailPaths              string
+	MeGroupsPaths             string
+	MeUserInfoURL             string
+	ProxyAuthEnabled          bool
+	ProxyAuthUsernameHeader   string
+	ProxyAuthGroupHeader      string
+	ProxyAuthEmailHeader      string
+	ProxyAuthTokenHeader      string
+	ServerCtx                 context.Context
+	AdminSettings             json.RawMessage
+}
+
+type HeadlampCFG struct {
+	AppName                string
+	UseInCluster           bool
+	InClusterContextName   string
+	ListenAddr             string
+	CacheEnabled           bool
+	DevMode                bool
+	Insecure               bool
+	EnableHelm             bool
+	EnableDynamicClusters  bool
+	AllowKubeconfigChanges bool
+	WatchPluginsChanges    bool
+	Port                   uint
+	KubeConfigPath         string
+	KubeConfigDir          string
+	SkippedKubeContexts    string
+	StaticDir              string
+	PluginDir              string
+	UserPluginDir          string
+	StaticPluginDir        string
+	KubeConfigStore        kubeconfig.ContextStore
+	Telemetry              *telemetry.Telemetry
+	Metrics                *telemetry.Metrics
+	BaseURL                string
+	ProxyURLs              []string
+
+	TLSCertPath                  string
+	TLSKeyPath                   string
+	SessionTTL                   int
+	PodDebugImage                string
+	NodeShellImage               string
+	NodeShellNamespace           string
+	OidcUseCookie                bool
+	OidcUseTokenBroadcast        bool
+	DefaultLightTheme            string
+	DefaultDarkTheme             string
+	ForceTheme                   string
+	UnsafeUseServiceAccountToken bool
+	ServiceAccountTokenPath      string
+
+	EnableClusterInventory                bool
+	ClusterInventoryProviderFile          string
+	ClusterInventoryLabelSelector         string
+	ClusterInventoryNamespaces            string
+	ClusterInventoryRootReconcileInterval time.Duration
+	ClusterInventoryNoCRDCacheTTL         time.Duration
+}

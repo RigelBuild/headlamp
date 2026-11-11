@@ -1,0 +1,115 @@
+#!/usr/bin/env node
+
+import { Command } from 'commander';
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { checkRelease } from './commands/check.js';
+import { startRelease } from './commands/start.js';
+import { tagRelease } from './commands/tag.js';
+import { publishRelease } from './commands/publish.js';
+import { buildArtifacts } from './commands/build.js';
+import { getAppRuns } from './commands/get-app-runs.js';
+import { securityCheck } from './commands/security-check.js';
+import { verifyAssets } from './commands/verify-assets.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Read version from package.json
+const packageJsonPath = join(__dirname, '..', 'package.json');
+const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+const version = packageJson.version;
+
+const program = new Command();
+
+program.name('releaser')
+  .description('Headlamp release management tool')
+  .version(version, '-v, --version', 'display version number');
+
+program.command('check')
+  .description('Check if a release exists and verify all artifacts are present')
+  .argument('<release-version>', 'Version to check (e.g., 0.30.0)')
+  .action(checkRelease);
+
+program.command('security-check')
+  .description('Scan the backend for known vulnerabilities (govulncheck) and Dockerfiles for security issues (hadolint)')
+  .action(securityCheck);
+
+program.command('start')
+  .description('Update package.json with new version and commit changes')
+  .argument('<release-version>', 'New version number (e.g., 0.30.0)')
+  .option('--no-branch', 'Do not create a release branch (stay on current branch)')
+  .action(startRelease);
+
+program.command('tag')
+  .description('Create a signed git tag for the release (uses your git signing configuration)')
+  .option('--no-sign', 'Create an unsigned annotated tag instead')
+  .action(tagRelease);
+
+program.command('publish')
+  .description('Push tag, assign to release draft, and publish the release')
+  .argument('<release-version>', 'Version to publish (e.g., 0.30.0)')
+  .option('--force', 'Skip confirmation prompt')
+  .option('--allow-unsigned', 'Publish even if the release tag is not signed or GitHub can\'t verify its signature')
+  .action(publishRelease);
+
+// CI command with subcommands
+const ci = program.command('ci')
+  .description('CI-related commands');
+
+ci.command('verify-assets')
+  .description('Check that files are attached to a release and match the local copies')
+  .argument('<release-version>', 'Release to check (e.g., 0.30.0)')
+  .argument('<files...>', 'Local files to compare with the release assets')
+  .action(verifyAssets);
+
+ci.command('app')
+  .description('Manage app build workflows')
+  .option('--build <git-ref>', 'Trigger build artifact workflows for the specified git ref/branch/tag (e.g., main, v0.30.0)')
+  .option('--list', 'List the latest app build workflow runs')
+  .option('-p, --platform <platform>', 'Platform filter: all, windows, mac, or linux', 'all')
+  .option('--latest <number>', 'Number of recent runs to fetch when listing', '1')
+  .option('-o, --output <format>', 'Output format when listing: simple or json')
+  .option('--force', 'Skip confirmation prompt when building')
+  .action(async (options) => {
+    // Check if both --build and --list are provided
+    if (options.build && options.list) {
+      console.error('Error: Cannot use both --build and --list options together');
+      process.exit(1);
+    }
+
+    // Check if neither --build nor --list are provided
+    if (!options.build && !options.list) {
+      console.error('Error: Must specify either --build <git-ref> or --list');
+      process.exit(1);
+    }
+
+    if (options.build) {
+      // Build artifacts
+      await buildArtifacts(options.build, {
+        platform: options.platform,
+        force: options.force,
+      });
+    } else if (options.list) {
+      // List app runs
+      const latestNum = parseInt(options.latest, 10);
+      if (
+        isNaN(latestNum) ||
+        !Number.isInteger(latestNum) ||
+        latestNum <= 0
+      ) {
+        console.error(
+          `Error: --latest must be a valid positive integer (got "${options.latest}")`
+        );
+        process.exit(1);
+      }
+      await getAppRuns({
+        platform: options.platform,
+        latest: latestNum,
+        output: options.output,
+      });
+    }
+  });
+
+program.parse();

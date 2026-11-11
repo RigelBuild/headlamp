@@ -624,6 +624,29 @@ function flattenListRequests(
   );
 }
 
+/**
+ * Whether a currently-watched list is still covered by one of the given requests.
+ *
+ * An empty-string namespace is a real, valid value: it means "all namespaces" for a
+ * namespaced resource, and it is what a request with no namespace filter produces.
+ * Because it is falsy, matching it against a request's namespace list needs an
+ * explicit undefined check rather than a truthiness check, or the watch entry is
+ * dropped every render and immediately re-added, looping setState (see 9542b5cb5).
+ * The unfiltered branch keeps the falsy check on purpose, so a watch on '' still
+ * matches a request that asks for no particular namespace.
+ */
+export function isWatchedListStillRequested(
+  watching: { cluster: string; namespace?: string },
+  requests: Array<{ cluster: string; namespaces?: string[] }>
+): boolean {
+  return requests.some(request => {
+    if (watching.cluster !== request?.cluster) return false;
+    return !request.namespaces?.length
+      ? !watching.namespace
+      : watching.namespace !== undefined && request.namespaces.includes(watching.namespace);
+  });
+}
+
 function getPositiveLimit(queryParams: QueryParameters): number | undefined {
   const limit = Number(queryParams.limit);
 
@@ -737,24 +760,50 @@ export function useKubeObjectList<K extends KubeObject>({
           result.data.list.metadata.remainingItemCount === undefined
       );
 
+      // A cluster gets one request per allowed namespace, so group the results by cluster and
+      // combine them, instead of letting the last namespace replace the others. Every request
+      // counts, also the ones still loading or failed. A request still loading shows its
+      // placeholder data, which React Query reports as a success, so isPlaceholderData is what
+      // marks it as loading.
+      const resultsByCluster: Record<string, typeof results> = {};
+      results.forEach((result, index) => {
+        const cluster = activeListRequests[index]?.cluster;
+        if (cluster) {
+          (resultsByCluster[cluster] ??= []).push(result);
+        }
+      });
+      const clusterResults: Record<string, QueryListResponse<any, K, ApiError>> = {};
+      Object.entries(resultsByCluster).forEach(([cluster, clusterQueryResults]) => {
+        const withData = clusterQueryResults.filter(result => result.data);
+        // A cluster only gets an entry once one of its namespaces has data, as before.
+        if (withData.length === 0) {
+          return;
+        }
+        const errors = clusterQueryResults
+          .map(result => result.error)
+          .filter((error): error is ApiError => !!error);
+        const isError = clusterQueryResults.some(result => result.isError);
+        const isSuccess = clusterQueryResults.every(
+          result => result.isSuccess && !result.isPlaceholderData
+        );
+        clusterResults[cluster] = {
+          data: withData[0].data,
+          error: errors[0] ?? null,
+          errors: errors.length > 0 ? errors : null,
+          isError,
+          isFetching: clusterQueryResults.some(result => result.isFetching),
+          isLoading: clusterQueryResults.some(
+            result => result.isLoading || result.isPlaceholderData
+          ),
+          isSuccess,
+          items: withData.flatMap(result => result.data?.list?.items ?? []),
+          status: isError ? 'error' : isSuccess ? 'success' : 'pending',
+        };
+      });
+
       return {
         data: results.map(result => result.data),
-        clusterResults: results.reduce((acc, result) => {
-          if (result.data && result.data.cluster) {
-            acc[result.data.cluster] = {
-              data: result.data,
-              error: result.error,
-              errors: result.error ? [result.error] : null,
-              isError: result.isError,
-              isFetching: result.isFetching,
-              isLoading: result.isLoading,
-              isSuccess: result.isSuccess,
-              items: result?.data?.list?.items ?? null,
-              status: result.status,
-            };
-          }
-          return acc;
-        }, {} as Record<string, QueryListResponse<any, K, ApiError>>),
+        clusterResults,
         items:
           emptyWhenNoRequests && results.length === 0
             ? []
@@ -789,14 +838,8 @@ export function useKubeObjectList<K extends KubeObject>({
 
   useEffect(() => {
     setListsToWatch(currentListsToWatch => {
-      const keptListsToWatch = currentListsToWatch.filter(
-        watching =>
-          requests.find(request => {
-            if (watching.cluster !== request?.cluster) return false;
-            return !request.namespaces?.length
-              ? !watching.namespace
-              : !!watching.namespace && request.namespaces.includes(watching.namespace);
-          }) !== undefined
+      const keptListsToWatch = currentListsToWatch.filter(watching =>
+        isWatchedListStillRequested(watching, requests)
       );
 
       if (!shouldWatch) {

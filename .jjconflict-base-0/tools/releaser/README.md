@@ -1,0 +1,232 @@
+# Headlamp Releaser
+
+A CLI tool for managing Headlamp releases. It automates version bumping, tagging, publishing, and CI build management.
+
+## Prerequisites
+
+- **Node.js** >= 20.11.1
+- **npm** >= 10.0.0
+- **Git** (with push access to the repository)
+- **GitHub Personal Access Token** with `repo`, `workflow`, and `read:packages` scopes, set as the `GITHUB_TOKEN` environment variable
+
+## Setup
+
+```bash
+cd tools/releaser
+npm install
+npm run build
+```
+
+This compiles the TypeScript source into the `dist/` directory. To make the `releaser` command available, link the package:
+
+```bash
+npm link
+```
+
+You can then run the tool as:
+
+```bash
+releaser <command>
+```
+
+## Typical Release Workflow
+
+```bash
+export GITHUB_TOKEN=your-token-here
+
+# 1. Start the release (creates branch hl-rc-0.42.0, bumps version
+#    in app/package.json and charts/headlamp/Chart.yaml, runs npm install,
+#    regenerates Helm templates, and commits)
+releaser start 0.42.0
+
+# 2. Create the GitHub draft release
+#    Run the "Create Release Draft" workflow (.github/workflows/draft-release.yml)
+#    via the GitHub Actions UI with releaseName: 0.42.0
+
+# 3. Create the release tag (reads version from app/package.json,
+#    creates a signed, annotated git tag v0.42.0)
+releaser tag
+
+# 4. Verify the draft release and its required artifacts before publishing
+#    (fetches the GitHub release, checks Mac/Linux/Windows build artifacts exist)
+releaser check 0.42.0
+
+# 5. Publish the release (pushes tag to remote, associates it with the
+#    draft release, and marks the release as published — irreversible)
+releaser publish 0.42.0
+
+# 6. (Optional) Re-run checks after publishing for extended asset verification
+#    (also checks container images, Homebrew, winget, Chocolatey, Flatpak, etc.)
+releaser check 0.42.0
+```
+
+## Usage
+
+### `check` — Verify a release
+
+Check whether a release exists on GitHub and verify that all required artifacts (Mac, Linux, Windows), the `checksums.txt` cosign signature (`checksums.txt.sigstore.json`), and the release provenance (`headlamp-<version>.intoto.jsonl`) are present. Once the `v<version>` tag is on GitHub, it also checks that the tag is signed (failing for unsigned or lightweight tags and invalid signatures, such as ones made with an expired key) and warns if GitHub can't match the signing key to the tagger's GitHub account or couldn't check the signature at the moment. Run it before and after publishing a release.
+
+```bash
+releaser check <release-version>
+```
+
+**Example:**
+
+```bash
+releaser check 0.42.0
+```
+
+For published releases, this also checks extended assets such as container images, Homebrew, winget, Chocolatey, Flatpak, Docker extension, Helm, and Minikube.
+
+### `start` — Start a new release
+
+Update `app/package.json` and `charts/headlamp/Chart.yaml` with the new version, run `npm install` in the app directory, regenerate Helm expected templates via `make helm-update-template-version` (requires `make`, `bash`, and `helm` on PATH), and commit the changes. By default, a release branch named `hl-rc-<version>` is created.
+
+```bash
+releaser start <release-version> [options]
+```
+
+**Options:**
+
+| Option | Description |
+|---|---|
+| `--no-branch` | Stay on the current branch instead of creating a release branch |
+
+**Example:**
+
+```bash
+# Create a release branch and bump version
+releaser start 0.42.0
+
+# Bump version on the current branch
+releaser start 0.42.0 --no-branch
+```
+
+### `tag` — Create a release tag
+
+Create a signed, annotated git tag (`v<version>`) for the current version read from `app/package.json`. The tag is signed with your configured git signing key (`git tag -s`, GPG or SSH). Make sure your signing key is [added to your GitHub account](https://docs.github.com/en/authentication/managing-commit-signature-verification) as a signing key, so the tag shows as **Verified**.
+
+```bash
+releaser tag
+```
+
+**Options:**
+
+| Option | Description |
+|---|---|
+| `--no-sign` | Create an unsigned annotated tag instead. `releaser publish` refuses unsigned tags unless `--allow-unsigned` is passed |
+
+To check the signature of a tag:
+
+- **Locally**: `git tag -v v<version>`. For GPG-signed tags this works once the signer's public key is in your keyring, which your own key already is. For SSH-signed tags, git first needs an allowed signers file listing the signer's key; see [Verifying Releases](../../docs/installation/verify-releases.md#source-code) for the commands.
+- **On GitHub**, after pushing it: open the tag on the [tags page](https://github.com/kubernetes-sigs/headlamp/tags) and look for the **Verified** label. `releaser check` and `releaser publish` check this too.
+
+### `publish` — Publish a release
+
+Push the tag to the remote, associate it with the GitHub release draft, and publish the release. You will be prompted for confirmation unless `--force` is used. The release tag must exist locally and be signed (see `releaser tag`). After pushing the tag, it stops without publishing if GitHub reports the tag as missing, unsigned, or with an invalid signature (for example one made with an expired key), unless `--allow-unsigned` is passed; it only warns if GitHub can't attribute the signature to your account, for example because your signing key is not registered on your GitHub account, or couldn't check it right now.
+
+```bash
+releaser publish <release-version> [options]
+```
+
+**Options:**
+
+| Option | Description |
+|---|---|
+| `--force` | Skip the confirmation prompt |
+| `--allow-unsigned` | Publish even if the release tag is not signed or GitHub can't verify its signature |
+
+**Example:**
+
+```bash
+releaser publish 0.42.0
+releaser publish 0.42.0 --force
+```
+
+### `ci app` — Manage CI app build workflows
+
+Trigger or list app build workflow runs on GitHub Actions.
+
+The build workflows run from the given git ref itself, so the build provenance
+that they generate records it as the source. Release assets can't be uploaded
+without that provenance, so trigger release builds with `releaser ci app` rather
+than running the workflows from `main` with a different build branch.
+
+```bash
+# Trigger builds
+releaser ci app --build <git-ref> [options]
+
+# List recent runs
+releaser ci app --list [options]
+```
+
+**Options:**
+
+| Option | Description |
+|---|---|
+| `--build <git-ref>` | Trigger build workflows for the specified git ref (branch or tag) |
+| `--list` | List the latest app build workflow runs |
+| `-p, --platform <platform>` | Platform filter: `all`, `windows`, `mac`, or `linux` (default: `all`) |
+| `--latest <number>` | Number of recent runs to fetch when listing (default: `1`) |
+| `-o, --output <format>` | Output format when listing: `simple` or `json` (default: detailed) |
+| `--force` | Skip the confirmation prompt when building |
+
+**Examples:**
+
+```bash
+# Trigger builds for all platforms on a tag
+releaser ci app --build v0.42.0
+
+# Trigger a Linux-only build
+releaser ci app --build main --platform linux --force
+
+# List the latest run for each platform
+releaser ci app --list
+
+# List the 3 most recent Mac runs in JSON format
+releaser ci app --list --platform mac --latest 3 --output json
+```
+
+### `ci verify-assets` — Check files attached to a release
+
+Check that each file is attached to the release under the same name, and that the attached copy matches the local file. Exits non-zero if any file is missing or different. The Upload Release Assets workflow uses this to check that the `checksums.txt` signature was attached.
+
+```bash
+releaser ci verify-assets <release-version> <files...>
+```
+
+**Example:**
+
+```bash
+releaser ci verify-assets 0.42.0 ./checksums.txt.sigstore.json ./headlamp-0.42.0.intoto.jsonl
+```
+
+### `security-check` — Scan the backend and Dockerfiles for security issues
+
+Runs [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) against the Go backend module to catch known vulnerabilities, and [`hadolint`](https://github.com/hadolint/hadolint) against `Dockerfile`, `Dockerfile.plugins`, and `docker-extension/Dockerfile` to catch Dockerfile security issues (e.g. unpinned packages, missing pipefail on piped `RUN` commands). Exits non-zero if any check reports a real problem.
+
+Requires the Go toolchain (for `govulncheck`) and Docker (used to run `hadolint` without a local install) to be available on `PATH`; a check is skipped with a warning if its tool isn't found.
+
+```bash
+releaser security-check
+```
+
+## Development
+
+Source code is in `src/` and is organized as follows:
+
+- `src/index.ts` — CLI entry point and command definitions
+- `src/commands/` — Individual command implementations (`check`, `start`, `tag`, `publish`, `build`, `get-app-runs`, `security-check`, `verify-assets`)
+- `src/utils/` — Shared utilities (`git`, `github`, `version`, `security`)
+
+To rebuild after making changes:
+
+```bash
+npm run build
+```
+
+To run the unit tests (`src/**/*.test.ts`, using Node's built-in test runner):
+
+```bash
+npm test
+```

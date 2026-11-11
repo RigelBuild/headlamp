@@ -22,11 +22,15 @@ import { useTranslation } from 'react-i18next';
 import { getClusterAppearanceFromMeta } from '../../helpers/clusterAppearance';
 import { isElectron } from '../../helpers/isElectron';
 import { useClustersConf, useSelectedClusters } from '../../lib/k8s';
+import CompositePodGroup from '../../lib/k8s/compositePodGroup';
 import CRD from '../../lib/k8s/crd';
+import DeviceClass from '../../lib/k8s/deviceClass';
 import { useGatewayL4RouteAvailability } from '../../lib/k8s/gatewayL4RouteAvailability';
 import PodGroup from '../../lib/k8s/podGroup';
+import { useIsResourceServed } from '../../lib/k8s/resourceAvailability';
 import { createRouteURL } from '../../lib/router/createRouteURL';
 import { useTypedSelector } from '../../redux/hooks';
+import { selectEffectiveSettings } from '../../settings/useAdminSettings';
 import { DefaultSidebars, SidebarEntryProps, SidebarItemProps } from '.';
 import ClusterBadge from './ClusterBadge';
 
@@ -57,7 +61,7 @@ const sortSidebarItems = (items: SidebarItemProps[]): SidebarItemProps[] => {
 
 export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER) => {
   const clusters = useTypedSelector(state => state.config.clusters) ?? {};
-  const settings = useTypedSelector(state => state.config.settings);
+  const settings = useTypedSelector(selectEffectiveSettings);
   const customSidebarEntries = useTypedSelector(state => state.sidebar.entries);
   const customSidebarFilters = useTypedSelector(state => state.sidebar.filters);
   const customHomeSidebarFilters = useTypedSelector(state => state.sidebar.homeFilters);
@@ -85,6 +89,23 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
     queryFn: async () => {
       const enabledPerCluster = await Promise.all(
         selectedClusters.map(cluster => PodGroup.isEnabled(cluster))
+      );
+      return enabledPerCluster.some(Boolean);
+    },
+    enabled: selectedClusters.length > 0,
+  });
+
+  // Dynamic resource allocation is stable from Kubernetes 1.34, so only show the
+  // Devices section on clusters that serve resource.k8s.io/v1.
+  const devicesEnabled = useIsResourceServed(DeviceClass);
+
+  // CompositePodGroup needs its own feature gate on top, and unlike the flat resources
+  // it is only ever served by v1alpha3, so ask for the resource itself.
+  const { data: compositePodGroupsEnabled = false } = useQuery({
+    queryKey: ['compositePodGroupsEnabled', ...selectedClusters],
+    queryFn: async () => {
+      const enabledPerCluster = await Promise.all(
+        selectedClusters.map(cluster => CompositePodGroup.isEnabled(cluster))
       );
       return enabledPerCluster.some(Boolean);
     },
@@ -472,6 +493,28 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
       },
     ];
 
+    if (devicesEnabled) {
+      inClusterItems.push({
+        name: 'devices',
+        label: t('glossary|Devices (alpha)'),
+        icon: 'mdi:expansion-card',
+        subList: [
+          {
+            name: 'deviceClasses',
+            label: t('glossary|Device Classes'),
+          },
+          {
+            name: 'resourceClaims',
+            label: t('glossary|Resource Claims'),
+          },
+          {
+            name: 'resourceClaimTemplates',
+            label: t('glossary|Resource Claim Templates'),
+          },
+        ],
+      });
+    }
+
     if (schedulingWorkloadsEnabled) {
       inClusterItems.push({
         name: 'scheduling',
@@ -482,6 +525,14 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
             name: 'podGroups',
             label: t('glossary|Pod Groups'),
           },
+          ...(compositePodGroupsEnabled
+            ? [
+                {
+                  name: 'compositePodGroups',
+                  label: t('glossary|Composite Pod Groups'),
+                },
+              ]
+            : []),
           {
             name: 'schedulingWorkloads',
             label: t('glossary|Workloads'),
@@ -616,7 +667,9 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
     allClustersConf,
     crdsSidebarEntries,
     gatewayKinds,
+    devicesEnabled,
     schedulingWorkloadsEnabled,
+    compositePodGroupsEnabled,
     t,
   ]);
 

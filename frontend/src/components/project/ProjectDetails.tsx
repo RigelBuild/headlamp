@@ -44,11 +44,13 @@ import { ButtonStyle, EditButton, EditorDialog, Loader, StatusLabel } from '../c
 import Link from '../common/Link';
 import ResourceTable from '../common/Resource/ResourceTable';
 import SectionBox from '../common/SectionBox';
-import { GraphFilter } from '../resourceMap/graph/graphFiltering';
+import { GraphFilter, namespaceClusterKey } from '../resourceMap/graph/graphFiltering';
 import { GraphView } from '../resourceMap/GraphView';
 import { ResourceQuotaTable } from '../resourceQuota/Details';
 import { ProjectDeleteButton } from './ProjectDeleteButton';
+import { projectListRequests } from './projectGrouping';
 import { useProject } from './ProjectList';
+import { ProjectOverviewSectionCard } from './ProjectOverviewSectionCard';
 import { getEnabledProjectOverviewSections } from './projectOverviewSections';
 import { ProjectResourcesTab, useResourceCategoriesList } from './ProjectResourcesTab';
 import { getHealthIcon, getResourcesHealth } from './projectUtils';
@@ -332,13 +334,12 @@ function ProjectOverview({
       </Grid>
 
       {projectSections.map(section => (
-        <Grid key={section.id} item xs={12} md={4}>
-          <Card sx={{ height: '100%' }}>
-            <CardContent>
-              <section.component project={project} projectResources={projectResources} />
-            </CardContent>
-          </Card>
-        </Grid>
+        <ProjectOverviewSectionCard
+          key={section.id}
+          project={project}
+          projectResources={projectResources}
+          section={section}
+        />
       ))}
     </Grid>
   );
@@ -371,21 +372,26 @@ function ProjectResources({
 /** Access tab for the Project Details */
 function ProjectAccess({ project }: { project: ProjectDefinition }) {
   const { t } = useTranslation();
+  const requests = useMemo(() => projectListRequests(project), [project]);
+  const roles = Role.useList({ requests });
+  const roleBindings = RoleBinding.useList({ requests });
   return (
     <Box sx={{ my: 3 }}>
       <SelectedClustersContext.Provider value={project.clusters}>
         <Typography variant="h6">{t('Roles')}</Typography>
         <ResourceTable
-          resourceClass={Role}
+          id={`headlamp-${Role.pluralName}`}
           columns={['type', 'name', 'age']}
-          namespaces={project.namespaces}
+          data={roles.items}
+          errors={roles.errors}
           enableRowActions
         />
         <Typography variant="h6">{t('Role Bindings')}</Typography>
         <ResourceTable
-          resourceClass={RoleBinding}
+          id={`headlamp-${RoleBinding.pluralName}`}
           columns={['type', 'name', 'age']}
-          namespaces={project.namespaces}
+          data={roleBindings.items}
+          errors={roleBindings.errors}
           enableRowActions
         />
       </SelectedClustersContext.Provider>
@@ -513,6 +519,9 @@ export function ProjectDetailsContent({ project }: { project: ProjectDefinition 
   }, [project, items, isLoading]);
 
   useEffect(() => {
+    // Ignore results from tab evaluations superseded by a later effect.
+    let isCurrent = true;
+
     async function loadTabs() {
       const registeredTabsList = Object.values(registeredTabs);
       // Get a list of enabled Tabs
@@ -535,6 +544,10 @@ export function ProjectDetailsContent({ project }: { project: ProjectDefinition 
         )
       ).filter(Boolean) as ProjectDetailsTab[];
 
+      if (!isCurrent) {
+        return;
+      }
+
       const enabledTabsById = Object.fromEntries(enabledTabs.map(tab => [tab.id, tab]));
 
       // Merge default tabs with custom tabs
@@ -547,6 +560,10 @@ export function ProjectDetailsContent({ project }: { project: ProjectDefinition 
     }
 
     loadTabs();
+
+    return () => {
+      isCurrent = false;
+    };
   }, [registeredTabs, project]);
 
   // Set initial selected tab to the first available tab
@@ -602,7 +619,12 @@ export function ProjectDetailsContent({ project }: { project: ProjectDefinition 
   return (
     <ProjectDetailsContext.Provider value={contextValue}>
       <Box
-        sx={{ display: 'flex', flexDirection: 'column', height: '100%', alignItems: 'flex-start' }}
+        sx={{
+          display: 'flex',
+          flexDirection: 'column',
+          minHeight: '100%',
+          alignItems: 'flex-start',
+        }}
       >
         <SectionBox
           outterBoxProps={{
@@ -669,11 +691,19 @@ export function ProjectDetailsContent({ project }: { project: ProjectDefinition 
 }
 
 /** Map tab for the Project Details */
-function ProjectGraph({ project: { namespaces, clusters } }: { project: ProjectDefinition }) {
+function ProjectGraph({ project }: { project: ProjectDefinition }) {
+  const { namespaces, clusters, namespaceRefs } = project;
   const filters = useMemo(
     () =>
       [
-        namespaces.length > 0
+        namespaceRefs?.length
+          ? {
+              type: 'namespaceCluster',
+              namespaceRefs: new Set(
+                namespaceRefs.map(({ cluster, name }) => namespaceClusterKey(cluster, name))
+              ),
+            }
+          : namespaces.length > 0
           ? {
               type: 'namespace',
               namespaces: new Set(namespaces),
@@ -681,7 +711,7 @@ function ProjectGraph({ project: { namespaces, clusters } }: { project: ProjectD
           : undefined,
       ].filter(Boolean) as GraphFilter[],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [namespaces, clusters]
+    [namespaces, clusters, namespaceRefs]
   );
   return (
     <Box

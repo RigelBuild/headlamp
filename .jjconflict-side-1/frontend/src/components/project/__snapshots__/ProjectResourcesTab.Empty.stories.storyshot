@@ -1,0 +1,24 @@
+<body>
+  <div>
+    <div
+      style="height: 500px;"
+    >
+      <div
+        class="MuiBox-root css-1nsu8y8"
+        data-testid="project-resource-grid"
+      >
+        <div
+          class="MuiBox-root css-1tzj0y2"
+          data-testid="project-resource-categories"
+        >
+          <ul
+            class="MuiList-root MuiList-padding MuiList-dense css-h4y409-MuiList-root"
+          />
+        </div>
+        <div
+          class="MuiBox-root css-3t24g2"
+        />
+      </div>
+    </div>
+  </div>
+</body>

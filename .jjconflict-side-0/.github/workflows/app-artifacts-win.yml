@@ -1,0 +1,172 @@
+name: Build and upload Windows app artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildBranch:
+        description: 'Headlamp ref/branch/tag'
+        required: true
+        default: 'main'
+      signBinaries:
+        description: Sign the binaries
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    permissions:
+      id-token: write # For fetching an OpenID Connect (OIDC) token
+      contents: read
+      actions: write # needed to upload artifacts
+      attestations: write # needed to store the provenance attestation
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        path: build-helper
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: kubernetes-sigs/headlamp
+        ref: ${{ github.event.inputs.buildBranch }}
+        path: headlamp
+    - name: Setup nodejs
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 22.x
+        cache: 'npm'
+        cache-dependency-path: |
+          headlamp/app/package-lock.json
+          headlamp/frontend/package-lock.json
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '1.26.*'
+        cache-dependency-path: |
+          headlamp/backend/go.sum
+    - name: Dependencies
+      uses: crazy-max/ghaction-chocolatey@dfdcf5bba9c0a16358a21c13a06ec5c89024b3ac # v4.1.0
+      with:
+        args: install make
+    - name: Azure login
+      if: ${{ inputs.signBinaries }}
+      uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+      with:
+        client-id: ${{ secrets.WINDOWS_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZ_TENANT_ID }}
+        subscription-id: ${{ secrets.AZ_SUBSCRIPTION_ID }}
+    - name: Fetch certificates
+      if: ${{ inputs.signBinaries }}
+      shell: pwsh
+      run: |
+        az keyvault secret download --subscription ${{ secrets.AZ_SUBSCRIPTION_ID }} --vault-name headlamp --name HeadlampAuthCert --file c:\HeadlampAuthCert.pfx --encoding base64
+        az keyvault secret download --subscription ${{ secrets.AZ_SUBSCRIPTION_ID }} --vault-name headlamp --name ESRPHeadlampReqCert --file c:\HeadlampReqCert.pfx --encoding base64
+    - name: Set up certificates
+      if: ${{ inputs.signBinaries }}
+      shell: pwsh
+      run: |
+        Import-PfxCertificate -FilePath c:\HeadlampAuthCert.pfx -CertStoreLocation Cert:\LocalMachine\My -Exportable
+        Import-PfxCertificate -FilePath c:\HeadlampReqCert.pfx -CertStoreLocation Cert:\LocalMachine\My -Exportable
+
+    - name: Download and Set up ESRPClient
+      if: ${{ inputs.signBinaries }}
+      shell: pwsh
+      run: |
+        nuget.exe sources add -name esrp -source ${{ secrets.ESRP_NUGET_INDEX_URL }} -username headlamp -password ${{ secrets.AZ_DEVOPS_TOKEN }}
+        nuget.exe install Microsoft.EsrpClient -Version 1.2.80 -source  ${{ secrets.ESRP_NUGET_INDEX_URL }} | out-null
+
+    - name: Build Frontend
+      shell: pwsh
+      working-directory: headlamp
+      run: |
+        cd frontend
+        npm ci
+        npm run build
+
+    - name: Install App Dependencies and Setup Plugins
+      shell: pwsh
+      working-directory: headlamp
+      run: |
+        cd app
+        npm ci
+        node --experimental-strip-types scripts/setup-plugins.ts
+
+    - name: Build Windows ${{ matrix.arch }} App
+      shell: pwsh
+      working-directory: headlamp
+      run: |
+        if ("${{ inputs.signBinaries }}" -eq "true") {
+          $env:ESRP_PATH="$(Get-Location)\..\Microsoft.EsrpClient.1.2.80\tools\EsrpClient.exe"
+          $env:HEADLAMP_WINDOWS_CLIENT_ID="${{ secrets.WINDOWS_CLIENT_ID }}"
+          $env:HEADLAMP_WINDOWS_SIGN_EMAIL="${{ secrets.WINDOWS_SIGN_EMAIL }}"
+        } else {
+          echo "Not signing binaries"
+        }
+        cd app
+        npm run package -- --win --${{ matrix.arch }}
+
+    - name: Create MSI for ${{ matrix.arch }}
+      if: ${{ matrix.arch == 'x64' }}
+      shell: pwsh
+      working-directory: headlamp
+      env:
+        MSI_ARCH: ${{ matrix.arch }}
+      run: |
+        cd app
+        node windows/msi/build.js
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: Win-${{ matrix.arch }}-exes
+        path: ./headlamp/app/dist/Headlamp*${{ matrix.arch }}*.*
+        if-no-files-found: error
+        retention-days: 2
+
+    # Provenance records the workflow's commit as the source, so it is only
+    # generated when that commit was built, as with `releaser ci app`.
+    - name: Check that the workflow ref was built
+      id: source
+      shell: pwsh
+      run: |
+        $built = git -C headlamp rev-parse HEAD
+        if ($built -eq $env:GITHUB_SHA) {
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "matches=true"
+        } else {
+          Write-Output "::warning::Built $built, but the workflow ran from $env:GITHUB_SHA, so no provenance is generated. Run the workflow from the ref it builds for release builds."
+        }
+
+    - name: Generate provenance
+      id: attest
+      if: steps.source.outputs.matches == 'true'
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-path: headlamp/app/dist/Headlamp*${{ matrix.arch }}*.*
+
+    - name: Prepare provenance artifact
+      if: steps.source.outputs.matches == 'true'
+      shell: pwsh
+      env:
+        BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        ARCH: ${{ matrix.arch }}
+      run: |
+        New-Item -ItemType Directory -Force -Path provenance | Out-Null
+        Copy-Item -Path $env:BUNDLE_PATH -Destination "provenance/headlamp-win-$env:ARCH.intoto.jsonl"
+
+    - name: Upload provenance artifact
+      if: steps.source.outputs.matches == 'true'
+      uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+      with:
+        name: Provenance-win-${{ matrix.arch }}
+        path: ./provenance/headlamp-win-${{ matrix.arch }}.intoto.jsonl
+        if-no-files-found: error
+        retention-days: 2

@@ -1,0 +1,664 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package helm_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/helm"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"helm.sh/helm/v3/pkg/cli"
+	"helm.sh/helm/v3/pkg/repo"
+)
+
+const (
+	testUsername = "testuser"
+	testPassword = "testpass"
+)
+
+func newHelmHandler(t *testing.T) *helm.Handler {
+	t.Helper()
+
+	cache := cache.New[interface{}]()
+	require.NotNil(t, cache)
+
+	helmHandler, err := helm.NewHandlerWithSettings(cache, settings)
+	require.NoError(t, err)
+
+	return helmHandler
+}
+
+// newIsolatedHelmHandler creates a Handler with its own temporary repository config,
+// isolated from the shared test state used by newHelmHandler.
+func newIsolatedHelmHandler(t *testing.T) *helm.Handler {
+	t.Helper()
+
+	customSettings := cli.New()
+	customSettings.RepositoryConfig = filepath.Join(t.TempDir(), "repositories.yaml")
+
+	c := cache.New[interface{}]()
+	require.NotNil(t, c)
+
+	helmHandler, err := helm.NewHandlerWithSettings(c, customSettings)
+	require.NoError(t, err)
+
+	return helmHandler
+}
+
+// mustJSONBody marshals v to JSON and returns a buffer. Safe to use with test credentials.
+func mustJSONBody(t *testing.T, v any) *bytes.Buffer {
+	t.Helper()
+
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+
+	return bytes.NewBuffer(b)
+}
+
+// newAuthRepoIndexServer starts a test HTTP server that requires basic auth.
+func newAuthRepoIndexServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != testUsername || pass != testPassword {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"apiVersion":"v1","entries":{},"generated":"2025-01-01T00:00:00Z"}`))
+	}))
+}
+
+func checkRepoExists(t *testing.T, helmHandler *helm.Handler, repoName string) bool {
+	t.Helper()
+
+	listRepoReq, err := http.NewRequestWithContext(context.Background(),
+		"GET", "/clusters/minikube/helm/repositories", nil)
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+
+	helmHandler.ListRepo(rr, listRepoReq)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var listRepoResponse helm.ListRepoResponse
+
+	err = json.Unmarshal(rr.Body.Bytes(), &listRepoResponse)
+	require.NoError(t, err)
+
+	for _, repo := range listRepoResponse.Repositories {
+		if repo.Name == repoName {
+			return true
+		}
+	}
+
+	return false
+}
+
+//nolint:unparam // repoName and repoURL parameters always receive constants across existing tests.
+func testAddRepo(t *testing.T, helmHandler *helm.Handler, repoName, repoURL string) {
+	t.Helper()
+
+	addRepo := helm.AddUpdateRepoRequest{
+		Name: repoName,
+		URL:  repoURL,
+	}
+
+	addRepoRequest, err := http.NewRequestWithContext(context.Background(), "POST",
+		"/clusters/minikube/helm/repositories/charts", mustJSONBody(t, addRepo))
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+
+	helmHandler.AddRepo(rr, addRepoRequest)
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	assert.True(t, checkRepoExists(t, helmHandler, repoName))
+}
+
+// TestAddRepositoryToHelm.
+func TestAddRepository(t *testing.T) {
+	helmHandler := newHelmHandler(t)
+
+	t.Run("add_repo_success", func(t *testing.T) {
+		testAddRepo(t, helmHandler, "headlamp_test_repo", "https://kubernetes-sigs.github.io/headlamp/")
+	})
+
+	t.Run("invalid_add_repo_request", func(t *testing.T) {
+		addRepoRequest, err := http.NewRequestWithContext(context.Background(),
+			"POST", "/clusters/minikube/helm/repositories/charts",
+			bytes.NewBufferString("some invalid request string"))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+
+		helmHandler.AddRepo(rr, addRepoRequest)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+	})
+
+	t.Run("missing_name", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST",
+			"/clusters/minikube/helm/repositories/charts",
+			bytes.NewBufferString(`{"url":"https://kubernetes-sigs.github.io/headlamp/"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.AddRepo(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "name is required")
+	})
+
+	t.Run("missing_url", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST",
+			"/clusters/minikube/helm/repositories/charts",
+			bytes.NewBufferString(`{"name":"headlamp_test_repo"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.AddRepo(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "url is required")
+	})
+
+	t.Run("name_with_path_traversal_is_rejected", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "POST",
+			"/clusters/minikube/helm/repositories/charts",
+			bytes.NewBufferString(`{"name":"../../../escaped","url":"https://kubernetes-sigs.github.io/headlamp/"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.AddRepo(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "path separators")
+
+		assert.False(t, checkRepoExists(t, helmHandler, "../../../escaped"))
+	})
+}
+
+// TestRemoveRepository.
+func TestRemoveRepository(t *testing.T) {
+	helmHandler := newHelmHandler(t)
+
+	t.Run("remove_repo_success", func(t *testing.T) {
+		testAddRepo(t, helmHandler, "headlamp_test_repo", "https://kubernetes-sigs.github.io/headlamp/")
+
+		removeRepoRequest, err := http.NewRequestWithContext(context.Background(), "DELETE",
+			"/clusters/minikube/helm/repositories/?name=headlamp_test_repo", nil)
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.RemoveRepo(rr, removeRepoRequest)
+
+		assert.False(t, checkRepoExists(t, helmHandler, "headlamp_test_repo"))
+	})
+
+	t.Run("remove_repo_not_found", func(t *testing.T) {
+		removeRepoRequest, err := http.NewRequestWithContext(context.Background(), "DELETE",
+			"/clusters/minikube/helm/repositories/?name=repo-that-does-not-exist", nil)
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.RemoveRepo(rr, removeRepoRequest)
+
+		assert.Equal(t, http.StatusNotFound, rr.Code)
+	})
+}
+
+// TestUpdateRepo.
+func TestUpdateRepo(t *testing.T) {
+	helmHandler := newHelmHandler(t)
+
+	t.Run("update_repo_success", func(t *testing.T) {
+		testUpdateRepo(t, helmHandler)
+	})
+
+	t.Run("invalid_update_repo_request", func(t *testing.T) {
+		updateRepoRequest, err := http.NewRequestWithContext(context.Background(), "PUT",
+			"/clusters/minikube/helm/repositories", bytes.NewBufferString("some invalid request string"))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+
+		helmHandler.UpdateRepository(rr, updateRepoRequest)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+	})
+
+	t.Run("missing_name", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "PUT",
+			"/clusters/minikube/helm/repositories",
+			bytes.NewBufferString(`{"url":"https://kubernetes-sigs-update-url.github.io/headlamp/"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.UpdateRepository(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "name is required")
+	})
+
+	t.Run("missing_url", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "PUT",
+			"/clusters/minikube/helm/repositories",
+			bytes.NewBufferString(`{"name":"headlamp_test_repo"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.UpdateRepository(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "url is required")
+	})
+
+	t.Run("name_with_path_traversal_is_rejected", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), "PUT",
+			"/clusters/minikube/helm/repositories",
+			bytes.NewBufferString(`{"name":"../../../escaped","url":"https://kubernetes-sigs.github.io/headlamp/"}`))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.UpdateRepository(rr, req)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "path separators")
+	})
+}
+
+// TestListRepositories.
+func TestListRepositories(t *testing.T) {
+	helmHandler := newHelmHandler(t)
+
+	testAddRepo(t, helmHandler, "headlamp_test_repo", "https://kubernetes-sigs.github.io/headlamp/")
+
+	listRepoReq, err := http.NewRequestWithContext(context.Background(),
+		"GET", "/clusters/minikube/helm/repositories", nil)
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+
+	helmHandler.ListRepo(rr, listRepoReq)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Header().Get("Content-Type"), "application/json")
+
+	var listRepoResponse helm.ListRepoResponse
+
+	err = json.Unmarshal(rr.Body.Bytes(), &listRepoResponse)
+	assert.NoError(t, err)
+}
+
+func TestRemoveRepositoryMissingNameReturnsBadRequest(t *testing.T) {
+	helmHandler := newHelmHandler(t)
+
+	removeRepoRequest, err := http.NewRequestWithContext(context.Background(), "DELETE",
+		"/clusters/minikube/helm/repositories/", nil)
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	helmHandler.RemoveRepo(rr, removeRepoRequest)
+
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.Contains(t, rr.Body.String(), "name query parameter is required")
+}
+
+func TestListRepoSetsJSONContentType(t *testing.T) {
+	customSettings := cli.New()
+	customSettings.RepositoryConfig = filepath.Join(t.TempDir(), "repositories.yaml")
+
+	repoFile := repo.NewFile()
+	repoFile.Update(&repo.Entry{
+		Name: "sample",
+		URL:  "https://example.test/charts",
+	})
+	require.NoError(t, repoFile.WriteFile(customSettings.RepositoryConfig, 0o644))
+
+	cache := cache.New[interface{}]()
+	require.NotNil(t, cache)
+
+	helmHandler, err := helm.NewHandlerWithSettings(cache, customSettings)
+	require.NoError(t, err)
+
+	listRepoReq, err := http.NewRequestWithContext(context.Background(),
+		"GET", "/clusters/minikube/helm/repositories", nil)
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	helmHandler.ListRepo(rr, listRepoReq)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Header().Get("Content-Type"), "application/json")
+}
+
+func TestAddRepositoryWithAuth(t *testing.T) {
+	helmHandler := newIsolatedHelmHandler(t)
+
+	ts := newAuthRepoIndexServer(t)
+	defer ts.Close()
+
+	username := testUsername
+	password := testPassword
+
+	addRepo := helm.AddUpdateRepoRequest{
+		Name:     "auth_test_repo",
+		URL:      ts.URL,
+		Username: &username,
+		Password: &password,
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), "POST",
+		"/clusters/minikube/helm/repositories/charts", mustJSONBody(t, addRepo))
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	helmHandler.AddRepo(rr, req)
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	repoFile, err := repo.LoadFile(helmHandler.RepositoryConfig)
+	require.NoError(t, err)
+
+	addedEntry := repoFile.Get("auth_test_repo")
+	require.NotNil(t, addedEntry)
+	assert.Equal(t, testUsername, addedEntry.Username)
+	assert.Equal(t, testPassword, addedEntry.Password)
+}
+
+func testUpdateRepo(t *testing.T, helmHandler *helm.Handler) {
+	t.Helper()
+
+	testAddRepo(t, helmHandler, "headlamp_test_repo", "https://kubernetes-sigs.github.io/headlamp/")
+
+	updateRepo := helm.AddUpdateRepoRequest{
+		Name: "headlamp_test_repo",
+		URL:  "https://kubernetes-sigs-update-url.github.io/headlamp/",
+	}
+
+	updateRepoRequest, err := http.NewRequestWithContext(context.Background(),
+		"PUT", "/clusters/minikube/helm/repositories",
+		mustJSONBody(t, updateRepo))
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	helmHandler.UpdateRepository(rr, updateRepoRequest)
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	listRepoReq, err := http.NewRequestWithContext(context.Background(),
+		"GET", "/clusters/minikube/helm/repositories", nil)
+	require.NoError(t, err)
+
+	rr = httptest.NewRecorder()
+	helmHandler.ListRepo(rr, listRepoReq)
+
+	var listRepoResponse helm.ListRepoResponse
+
+	err = json.Unmarshal(rr.Body.Bytes(), &listRepoResponse)
+	assert.NoError(t, err)
+
+	for _, repo := range listRepoResponse.Repositories {
+		if repo.Name == "headlamp_test_repo" {
+			assert.Equal(t, "https://kubernetes-sigs-update-url.github.io/headlamp/", repo.URL)
+		}
+	}
+}
+
+func TestUpdateRepositoryPreservesAuth(t *testing.T) {
+	helmHandler := newIsolatedHelmHandler(t)
+
+	ts := newAuthRepoIndexServer(t)
+	defer ts.Close()
+
+	username := testUsername
+	password := testPassword
+
+	addRepo := helm.AddUpdateRepoRequest{
+		Name:     "auth_update_repo",
+		URL:      ts.URL,
+		Username: &username,
+		Password: &password,
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), "POST",
+		"/clusters/minikube/helm/repositories/charts", mustJSONBody(t, addRepo))
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	helmHandler.AddRepo(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	updateRepo := helm.AddUpdateRepoRequest{
+		Name: "auth_update_repo",
+		URL:  ts.URL,
+	}
+
+	updateReq, err := http.NewRequestWithContext(context.Background(), "PUT",
+		"/clusters/minikube/helm/repositories", mustJSONBody(t, updateRepo))
+	require.NoError(t, err)
+
+	rr = httptest.NewRecorder()
+	helmHandler.UpdateRepository(rr, updateReq)
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	repoFile, err := repo.LoadFile(helmHandler.RepositoryConfig)
+	require.NoError(t, err)
+
+	updatedEntry := repoFile.Get("auth_update_repo")
+	require.NotNil(t, updatedEntry)
+
+	assert.Equal(t, testUsername, updatedEntry.Username)
+	assert.Equal(t, testPassword, updatedEntry.Password)
+}
+
+// newHelmHandlerWithRepoFile creates a Handler whose repository config is
+// seeded with the given entries, so tests can set server-side fields
+// (credentials, TLS file paths) that the HTTP API does not accept.
+func newHelmHandlerWithRepoFile(t *testing.T, entries ...*repo.Entry) *helm.Handler {
+	t.Helper()
+
+	customSettings := cli.New()
+	customSettings.RepositoryConfig = filepath.Join(t.TempDir(), "repositories.yaml")
+
+	repoFile := repo.NewFile()
+	for _, entry := range entries {
+		repoFile.Update(entry)
+	}
+
+	require.NoError(t, repoFile.WriteFile(customSettings.RepositoryConfig, 0o644))
+
+	c := cache.New[interface{}]()
+	require.NotNil(t, c)
+
+	helmHandler, err := helm.NewHandlerWithSettings(c, customSettings)
+	require.NoError(t, err)
+
+	return helmHandler
+}
+
+// TestAddRepoPreservesExistingServerSideFields is a regression test for
+// AddRepo replacing an existing repository entry wholesale, silently wiping
+// the server-side fields (username, password, certFile, keyFile, caFile) that
+// the HTTP API deliberately does not accept from clients.
+func TestAddRepoPreservesExistingServerSideFields(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != testUsername || pass != testPassword {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"apiVersion":"v1","entries":{},"generated":"2025-01-01T00:00:00Z"}`))
+	}))
+	defer ts.Close()
+
+	// The server certificate acts as the CA file the entry references, so the
+	// index download only succeeds if the preserved fields are actually used.
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ts.Certificate().Raw})
+	require.NoError(t, os.WriteFile(caPath, caPEM, 0o600))
+
+	helmHandler := newHelmHandlerWithRepoFile(t, &repo.Entry{
+		Name:     "private_repo",
+		URL:      ts.URL,
+		Username: testUsername,
+		Password: testPassword,
+		CAFile:   caPath,
+	})
+
+	// Re-add the same repository with only name and URL, as the frontend does.
+	addRepo := helm.AddUpdateRepoRequest{
+		Name: "private_repo",
+		URL:  ts.URL,
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), "POST",
+		"/clusters/minikube/helm/repositories/charts", mustJSONBody(t, addRepo))
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	helmHandler.AddRepo(rr, req)
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	repoFile, err := repo.LoadFile(helmHandler.RepositoryConfig)
+	require.NoError(t, err)
+
+	entry := repoFile.Get("private_repo")
+	require.NotNil(t, entry)
+	assert.Equal(t, testUsername, entry.Username)
+	assert.Equal(t, testPassword, entry.Password)
+	assert.Equal(t, caPath, entry.CAFile)
+}
+
+// TestAddRepoRequestFieldsOverrideExisting verifies that fields supplied in
+// the add request still win over the preserved server-side values.
+func TestAddRepoRequestFieldsOverrideExisting(t *testing.T) {
+	ts := newAuthRepoIndexServer(t)
+	defer ts.Close()
+
+	helmHandler := newHelmHandlerWithRepoFile(t, &repo.Entry{
+		Name:     "auth_override_repo",
+		URL:      ts.URL,
+		Username: "olduser",
+		Password: "oldpass",
+	})
+
+	username := testUsername
+	password := testPassword
+
+	addRepo := helm.AddUpdateRepoRequest{
+		Name:     "auth_override_repo",
+		URL:      ts.URL,
+		Username: &username,
+		Password: &password,
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), "POST",
+		"/clusters/minikube/helm/repositories/charts", mustJSONBody(t, addRepo))
+	require.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	helmHandler.AddRepo(rr, req)
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	repoFile, err := repo.LoadFile(helmHandler.RepositoryConfig)
+	require.NoError(t, err)
+
+	entry := repoFile.Get("auth_override_repo")
+	require.NotNil(t, entry)
+	assert.Equal(t, testUsername, entry.Username)
+	assert.Equal(t, testPassword, entry.Password)
+}
+
+func TestCreateFileIfNotThere(t *testing.T) {
+	t.Run("creates_missing_file_and_directories", func(t *testing.T) {
+		dir := t.TempDir()
+
+		customSettings := cli.New()
+		customSettings.RepositoryConfig = filepath.Join(dir, "nonexistent", "subdir", "repositories.yaml")
+
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"apiVersion":"v1","entries":{},"generated":"2025-01-01T00:00:00Z"}`))
+		}))
+		defer ts.Close()
+
+		c := cache.New[interface{}]()
+		helmHandler, err := helm.NewHandlerWithSettings(c, customSettings)
+		require.NoError(t, err)
+
+		addRepo := helm.AddUpdateRepoRequest{
+			Name: "file_create_test_repo",
+			URL:  ts.URL,
+		}
+
+		req, err := http.NewRequestWithContext(context.Background(), "POST",
+			"/clusters/minikube/helm/repositories/charts", mustJSONBody(t, addRepo))
+		require.NoError(t, err)
+
+		rr := httptest.NewRecorder()
+		helmHandler.AddRepo(rr, req)
+		assert.Equal(t, http.StatusOK, rr.Code)
+
+		_, statErr := os.Stat(customSettings.RepositoryConfig)
+		assert.NoError(t, statErr, "repository config file should have been created by createFileIfNotThere")
+	})
+}
+
+// TestAddUpdateRepoRequestValidateRejectsPathSeparators covers the regression for a repository
+// name such as "../../../escaped", which DownloadIndexFile would otherwise turn into a cache
+// index file path outside the Helm repository cache directory.
+func TestAddUpdateRepoRequestValidateRejectsPathSeparators(t *testing.T) {
+	tests := []struct {
+		name      string
+		repoName  string
+		expectErr bool
+	}{
+		{name: "parent_dir_prefix", repoName: "../x", expectErr: true},
+		{name: "forward_slash", repoName: "a/b", expectErr: true},
+		{name: "backslash", repoName: `a\b`, expectErr: true},
+		{name: "dot_dot_only", repoName: "..", expectErr: true},
+		{name: "dot_only_is_allowed", repoName: ".", expectErr: false},
+		{name: "leading_trailing_spaces_allowed", repoName: "  bitnami  ", expectErr: false},
+		{name: "normal_name_allowed", repoName: "bitnami", expectErr: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := helm.AddUpdateRepoRequest{
+				Name: tt.repoName,
+				URL:  "https://kubernetes-sigs.github.io/headlamp/",
+			}
+
+			err := req.Validate()
+
+			if tt.expectErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "path separators")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

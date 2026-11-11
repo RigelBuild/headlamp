@@ -2,6 +2,7 @@ package spa
 
 import (
 	"bytes"
+	"html"
 	"io"
 	"io/fs"
 	"net/http"
@@ -18,6 +19,8 @@ type embeddedSpaHandler struct {
 	indexPath string
 	// baseURL is the base URL of the application.
 	baseURL string
+	// productName is inserted into the index document title.
+	productName string
 }
 
 // ServeHTTP serves the static files embedded in the binary.
@@ -113,20 +116,54 @@ func sanitizeEmbeddedPath(rPath string) (string, bool) {
 }
 
 func (h embeddedSpaHandler) rewriteIndexContent(content []byte, isServingIndex bool) []byte {
-	if h.baseURL == "" || !isServingIndex {
+	if !isServingIndex {
 		return content
 	}
 
-	// Replace the __baseUrl__ assignment to use the baseURL instead of './'.
-	oldPattern := "__baseUrl__ = './<%= BASE_URL %>'.replace('%BASE_' + 'URL%', '').replace('<' + '%= BASE_URL %>', '');"
+	content = ReplaceProductName(content, h.productName)
+
+	runtimeBaseURL := h.baseURL + "/"
+	if h.baseURL == "" || h.baseURL == "/" {
+		runtimeBaseURL = "/"
+	}
+
+	content = bytes.ReplaceAll(
+		content,
+		[]byte(`<base href="./">`),
+		[]byte(`<base href="`+runtimeBaseURL+`">`),
+	)
+
+	if h.baseURL == "" {
+		return content
+	}
+
+	// Replace the __baseUrl__ assignment emitted by either frontend builder.
+	oldPatterns := []string{
+		"__baseUrl__ = './<%= BASE_URL %>'.replace('%BASE_' + 'URL%', '').replace('<' + '%= BASE_URL %>', '');",
+		"__baseUrl__ = '%BASE_URL%./'.replace('%BASE_' + 'URL%', '').replace('<' + '%= BASE_URL %>', '');",
+	}
+
 	newPattern := "__baseUrl__ = '" + h.baseURL + "';"
-	content = bytes.ReplaceAll(content, []byte(oldPattern), []byte(newPattern))
+	for _, oldPattern := range oldPatterns {
+		content = bytes.ReplaceAll(content, []byte(oldPattern), []byte(newPattern))
+	}
 
 	// Replace any remaining './' patterns in the content.
 	content = bytes.ReplaceAll(content, []byte("'./'"), []byte(h.baseURL+"/"))
 
 	// Replace url( patterns for CSS.
 	return bytes.ReplaceAll(content, []byte("url("), []byte("url("+h.baseURL+"/"))
+}
+
+const productNamePlaceholder = "<title data-headlamp-product-name></title>"
+
+// ReplaceProductName inserts an HTML-escaped product name into the index title placeholder.
+func ReplaceProductName(content []byte, productName string) []byte {
+	return bytes.ReplaceAll(
+		content,
+		[]byte(productNamePlaceholder),
+		[]byte("<title>"+html.EscapeString(productName)+"</title>"),
+	)
 }
 
 // tryServePrecompressed attempts to serve a precompressed sidecar (e.g.
@@ -181,10 +218,23 @@ func (h embeddedSpaHandler) serveFile(filePath string) ([]byte, error) {
 	return io.ReadAll(f)
 }
 
+// NewEmbeddedHandler creates an embedded SPA handler with an empty product name.
 func NewEmbeddedHandler(staticFS fs.FS, indexPath, baseURL string) *embeddedSpaHandler {
+	return NewEmbeddedHandlerWithProductName(staticFS, indexPath, baseURL, "")
+}
+
+// NewEmbeddedHandlerWithProductName creates an embedded SPA handler that inserts
+// the product name into the index title.
+func NewEmbeddedHandlerWithProductName(
+	staticFS fs.FS,
+	indexPath string,
+	baseURL string,
+	productName string,
+) *embeddedSpaHandler {
 	return &embeddedSpaHandler{
-		staticFS:  staticFS,
-		indexPath: indexPath,
-		baseURL:   baseURL,
+		staticFS:    staticFS,
+		indexPath:   indexPath,
+		baseURL:     baseURL,
+		productName: productName,
 	}
 }

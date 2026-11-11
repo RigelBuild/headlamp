@@ -18,7 +18,7 @@ import { has } from 'lodash';
 import React, { ReactNode } from 'react';
 import { AppLogoProps, AppLogoType } from '../components/App/AppLogo';
 import { PluginManager } from '../components/App/pluginManager';
-import { runCommand } from '../components/App/runCommand';
+import { type PluginRunCommand, runCommand } from '../components/App/runCommand';
 import { setBrandingAppLogoComponent, themeSlice } from '../components/App/themeSlice';
 import { ClusterChooserProps, ClusterChooserType } from '../components/cluster/ClusterChooser';
 import {
@@ -117,9 +117,11 @@ import {
   CustomCreateProject,
   ProjectDeleteButton,
   ProjectDetailsTab,
+  ProjectGrouping,
   ProjectHeaderAction,
   ProjectOverviewSection,
   setProjectDeleteButton,
+  setProjectGrouping,
 } from '../redux/projectsSlice';
 import { setRoute, setRouteFilter } from '../redux/routesSlice';
 import store from '../redux/stores/store';
@@ -130,6 +132,8 @@ import {
   PluginSettingsDetailsProps,
   setPluginSettingsComponent,
 } from './pluginsSlice';
+
+export { DefaultCreateProject } from '../redux/projectsSlice';
 
 export interface SectionFuncProps {
   title: string;
@@ -318,7 +322,7 @@ export default class Registry {
  *
  * ```
  *
- * @see {@link http://github.com/kinvolk/headlamp/plugins/examples/sidebar/ Sidebar Example}
+ * @see {@link https://github.com/kubernetes-sigs/headlamp/tree/main/plugins/examples/sidebar Sidebar Example}
  */
 export function registerSidebarEntry({
   parent,
@@ -461,7 +465,7 @@ export function registerRouteFilter(filterFunc: (entry: Route) => Route | null) 
  * ```
  *
  * @see {@link https://github.com/kinvolk/headlamp/blob/main/frontend/src/lib/router.tsx Route examples}
- * @see {@link http://github.com/kinvolk/headlamp/plugins/examples/sidebar/ Sidebar Example}
+ * @see {@link https://github.com/kubernetes-sigs/headlamp/tree/main/plugins/examples/sidebar Sidebar Example}
  *
  */
 export function registerRoute(routeSpec: Route) {
@@ -512,7 +516,7 @@ export function registerDetailsViewHeaderAction(headerAction: DetailsViewHeaderA
  * });
  *
  * More complete detail view example in plugins/examples/details-view:
- * @see {@link http://github.com/kinvolk/headlamp/plugins/examples/details-view/ Detail View Example}
+ * @see {@link https://github.com/kubernetes-sigs/headlamp/tree/main/plugins/examples/details-view Detail View Example}
  *
  */
 export function registerDetailsViewHeaderActionsProcessor(
@@ -688,7 +692,7 @@ export function registerDetailsViewSectionsProcessor(
  * ```
  *
  * More complete logo example in plugins/examples/change-logo:
- * @see {@link http://github.com/kinvolk/headlamp/plugins/examples/change-logo/ Change Logo Example}
+ * @see {@link https://github.com/kubernetes-sigs/headlamp/tree/main/plugins/examples/change-logo Change Logo Example}
  *
  */
 export function registerAppLogo(logo: AppLogoType) {
@@ -711,7 +715,7 @@ export function registerAppLogo(logo: AppLogoType) {
  * })
  * ```
  *
- * @see {@link http://github.com/kinvolk/headlamp/plugins/examples/cluster-chooser/ Cluster Chooser example}
+ * @see {@link https://github.com/kubernetes-sigs/headlamp/tree/main/plugins/examples/cluster-chooser Cluster Chooser example}
  *
  */
 export function registerClusterChooser(chooser: ClusterChooserType) {
@@ -1066,11 +1070,19 @@ export function registerAddClusterProvider(item: ClusterProviderInfo) {
   store.dispatch(addAddClusterProvider(item));
 }
 
+/** Options that control app theme registration. */
+export interface AppThemeRegistrationOptions {
+  /** Select the registered theme when the user has no saved theme preference. */
+  default?: boolean;
+}
+
 /**
  * Add a new theme that will be available in the settings.
  * Theme name should be unique
  *
  * @param theme - App Theme definition
+ * @param options - Options that control whether the theme is selected during registration.
+ * @returns Nothing.
  *
  * @example
  *
@@ -1080,11 +1092,14 @@ export function registerAddClusterProvider(item: ClusterProviderInfo) {
  *   base: "light",
  *   primary: "#ff0000",
  *   secondary: "#333",
- * })
+ * }, { default: true })
  *
  */
-export function registerAppTheme(theme: AppTheme) {
+export function registerAppTheme(theme: AppTheme, options: AppThemeRegistrationOptions = {}): void {
   store.dispatch(themeSlice.actions.addCustomAppTheme(theme));
+  if (options.default) {
+    store.dispatch(themeSlice.actions.setPluginDefaultTheme(theme.name));
+  }
 }
 
 /**
@@ -1143,21 +1158,51 @@ export function registerUIPanel(panel: UIPanel) {
  *
  * @example
  * ```tsx
+ * import {
+ *   DefaultCreateProject,
+ *   registerCustomCreateProject,
+ * } from '@kinvolk/headlamp-plugin/lib';
+ *
  * registerCustomCreateProject({
- *   id: "custom-create",
- *   name: "Create Helm Project",
- *   description: "Create new project from Helm chart",
- *   Component: ({onBack}) => <div>
- *     Create project
- *     <input name="helm-chart-id" />
- *     <button>Create</button>
- *     <button onClick={onBack}>Back</button>
- *   </div>,
- * })
+ *   id: DefaultCreateProject.NEW_PROJECT,
+ *   name: 'Create Managed Project',
+ *   description: 'Create a project managed by the platform',
+ *   icon: 'mdi:folder-plus',
+ *   component: ({ onBack }) => (
+ *     <div>
+ *       Create project
+ *       <button onClick={onBack}>Back</button>
+ *     </div>
+ *   ),
+ * });
  * ```
  */
 export function registerCustomCreateProject(customCreateProject: CustomCreateProject) {
   store.dispatch(addCustomCreateProject(customCreateProject));
+}
+
+/**
+ * Register custom grouping for project namespaces.
+ *
+ * The returned key is opaque and only distinguishes entries that share a project ID.
+ * Return the project ID to retain Headlamp's default cross-cluster grouping.
+ *
+ * @param projectGrouping - Project grouping definition
+ *
+ * @example
+ * ```tsx
+ * registerProjectGrouping({
+ *   getProjectKey: ({ namespace, projectId }) =>
+ *     namespace.metadata.labels?.['example.com/separate-by-cluster'] === 'true'
+ *       ? `${projectId}:${namespace.cluster}`
+ *       : projectId,
+ * });
+ * ```
+ *
+ * @returns Nothing.
+ */
+export function registerProjectGrouping(projectGrouping: ProjectGrouping) {
+  store.dispatch(setProjectGrouping(projectGrouping));
 }
 
 /**
@@ -1194,7 +1239,7 @@ export function registerProjectDetailsTab(projectDetailsTab: ProjectDetailsTab) 
  *
  * @param projectOverviewSection - The section configuration to register
  * @param projectOverviewSection.id - Unique identifier for the section
- * @param projectOverviewSection.component - React component receiving the current project and its loaded resources
+ * @param projectOverviewSection.component - React component receiving the current project and its loaded resources. Return `null` to hide the section's card; a wrapper element that renders nothing still shows an empty card.
  * @param projectOverviewSection.isEnabled - Optional asynchronous predicate receiving the project being evaluated
  * @returns void
  *
@@ -1382,4 +1427,4 @@ export {
   ConfigStore,
 };
 
-export type { CallbackActionOptions };
+export type { CallbackActionOptions, PluginRunCommand };

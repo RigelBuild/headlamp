@@ -382,12 +382,15 @@ export class KubeObject<T extends KubeObjectInterface | KubeEvent = any> {
       cluster,
       clusters,
       namespace,
+      requests: requestedLists,
       refetchInterval,
       ...queryParams
     }: {
       cluster?: string;
       clusters?: string[];
       namespace?: string | string[];
+      /** Exact cluster and namespace combinations to list instead of building a cross-product. */
+      requests?: Array<{ cluster: string; namespaces?: string[] }>;
       /** How often to refetch the list. Won't refetch by default. Disables watching if set. */
       refetchInterval?: number;
     } & QueryParameters = {}
@@ -401,6 +404,16 @@ export class KubeObject<T extends KubeObjectInterface | KubeEvent = any> {
     // Create requests for each cluster and namespace
     // eslint-disable-next-line react-hooks/rules-of-hooks
     const { requests, emptyWhenNoRequests } = useMemo(() => {
+      if (requestedLists) {
+        return {
+          requests: requestedLists.map(request => ({
+            cluster: request.cluster,
+            namespaces: isNamespaced ? request.namespaces : undefined,
+          })),
+          emptyWhenNoRequests: false,
+        };
+      }
+
       const clusterList = cluster
         ? [cluster]
         : clusters || (fallbackClusters.length === 0 ? [''] : fallbackClusters);
@@ -430,6 +443,7 @@ export class KubeObject<T extends KubeObjectInterface | KubeEvent = any> {
       clusters,
       fallbackClusters,
       namespace,
+      requestedLists,
       isNamespaced,
       allowedNamespacesResolutionKey,
     ]);
@@ -453,6 +467,11 @@ export class KubeObject<T extends KubeObjectInterface | KubeEvent = any> {
     opts?: {
       queryParams?: QueryParameters;
       cluster?: string;
+      /**
+       * Seed data to use before the query resolves. Must be reference-stable across
+       * renders (memoize it or capture it once) — an object rebuilt on every render
+       * will cause repeated re-renders.
+       */
       initialData?: K;
     }
   ) {
@@ -717,7 +736,11 @@ export class KubeObject<T extends KubeObjectInterface | KubeEvent = any> {
     }
   }
 
-  async getAuthorization(verb: string, reqResourseAttrs?: AuthRequestResourceAttrs) {
+  async getAuthorization(
+    verb: string,
+    reqResourseAttrs?: AuthRequestResourceAttrs,
+    cluster?: string
+  ) {
     const resourceAttrs: AuthRequestResourceAttrs = {
       name: this.getName(),
       verb,
@@ -743,7 +766,7 @@ export class KubeObject<T extends KubeObjectInterface | KubeEvent = any> {
       resourceAttrs['version'] = version;
     }
 
-    return this._class().getAuthorization(verb, resourceAttrs, this.cluster);
+    return this._class().getAuthorization(verb, resourceAttrs, cluster ?? this.cluster);
   }
 
   static getErrorMessage(err: ApiError | null) {

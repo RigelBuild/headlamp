@@ -2,6 +2,7 @@ package headlampconfig
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"time"
 
@@ -19,6 +20,7 @@ type WebSocketMultiplexer interface {
 // HeadlampConfig holds full server config. Lives here so packages (e.g. k8cache) can import without cmd.
 type HeadlampConfig struct {
 	*HeadlampCFG
+	OidcAutoLogin             bool
 	OidcClientID              string
 	OidcValidatorClientID     string
 	OidcClientSecret          string
@@ -29,6 +31,7 @@ type HeadlampConfig struct {
 	OidcSkipTLSVerify         bool
 	OidcCACert                string
 	OidcUsePKCE               bool
+	OidcSkipLogout            bool
 	OidcScopes                []string
 	Cache                     cache.Cache[interface{}]
 	Multiplexer               WebSocketMultiplexer
@@ -44,9 +47,11 @@ type HeadlampConfig struct {
 	ProxyAuthEmailHeader      string
 	ProxyAuthTokenHeader      string
 	ServerCtx                 context.Context
+	AdminSettings             json.RawMessage
 }
 
 type HeadlampCFG struct {
+	AppName                string
 	UseInCluster           bool
 	InClusterContextName   string
 	ListenAddr             string
@@ -78,6 +83,7 @@ type HeadlampCFG struct {
 	NodeShellImage               string
 	NodeShellNamespace           string
 	OidcUseCookie                bool
+	OidcUseTokenBroadcast        bool
 	DefaultLightTheme            string
 	DefaultDarkTheme             string
 	ForceTheme                   string
