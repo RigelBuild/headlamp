@@ -396,6 +396,7 @@ image:
 	$(DOCKER_CMD) $(DOCKER_BUILDX_CMD) build \
 	--pull \
 	--platform=$(DOCKER_PLATFORM) \
+	--build-arg HEADLAMP_GIT_VERSION=$(shell git rev-parse HEAD 2>/dev/null || echo unknown) \
 	$$BUILD_ARG \
 	--push=$(DOCKER_PUSH) \
 	-t $(DOCKER_REPO)/$(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_VERSION) \
