@@ -67,9 +67,11 @@ jobs:
         echo "BUILD_TAG=${{ env.BUILD_TAG }}"
         echo "CONTAINER_TAGS=${{ env.CONTAINER_TAGS }}"
     - name: checkout to build branch
+      id: src
       run: |
         git fetch --tags --force origin
         git checkout ${{ env.BUILD_TAG }}
+        echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
     - name: Log in to the Container registry
       uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v2.2.0
       with:
@@ -80,7 +82,7 @@ jobs:
       uses: docker/build-push-action@0a97817b6ade9f46837855d676c4cca3a2471fc9 # v4.2.1
       with:
         context: .
-        build-args: HEADLAMP_GIT_VERSION=${{ github.sha }}
+        build-args: HEADLAMP_GIT_VERSION=${{ steps.src.outputs.sha }}
         push: true
         pull: true
         platforms: linux/amd64,linux/arm64,linux/s390x,linux/ppc64le
