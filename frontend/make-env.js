@@ -20,11 +20,24 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 const appInfo = JSON.parse(fs.readFileSync('../app/package.json', 'utf8'));
 
-const gitVersion = execSync('git rev-parse HEAD').toString().trim();
+// Prefer the build-time value (set by the container build, where there is no
+// .git directory). Fall back to asking git for local dev builds, and to
+// "unknown" when neither is available.
+function gitVersion() {
+  const fromEnv = process.env.HEADLAMP_GIT_VERSION;
+  if (fromEnv) {
+    return fromEnv.trim();
+  }
+  try {
+    return execSync('git rev-parse HEAD', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  } catch {
+    return 'unknown';
+  }
+}
 
 const envContents = {
   REACT_APP_HEADLAMP_VERSION: appInfo.version,
-  REACT_APP_HEADLAMP_GIT_VERSION: gitVersion,
+  REACT_APP_HEADLAMP_GIT_VERSION: gitVersion(),
   REACT_APP_HEADLAMP_PRODUCT_NAME: appInfo.productName,
   REACT_APP_ENABLE_REACT_QUERY_DEVTOOLS: 'false',
   REACT_APP_HEADLAMP_SIDEBAR_DEFAULT_OPEN: 'true'

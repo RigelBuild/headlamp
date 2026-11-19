@@ -28,9 +28,11 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 FROM --platform=${BUILDPLATFORM} node:22@sha256:0557ac14e0d45d02ed563067b82856ca5e7aa3437fa28d98d4350ea9c3d9494a AS frontend-build
 
-# We need .git and app/ in order to get the version and git version for the frontend/.env file
-# that's generated when building the frontend.
-COPY .git/ ./headlamp/.git/
+# We need app/ in order to get the version for the frontend/.env file that's
+# generated when building the frontend. The git version comes from the
+# HEADLAMP_GIT_VERSION build arg, because the build context has no .git.
+ARG HEADLAMP_GIT_VERSION=unknown
+ENV HEADLAMP_GIT_VERSION=${HEADLAMP_GIT_VERSION}
 
 COPY app/package.json /headlamp/app/package.json
 
