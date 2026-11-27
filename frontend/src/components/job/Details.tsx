@@ -30,6 +30,8 @@ import {
   MetadataDictGrid,
   OwnedPodsSection,
 } from '../common/Resource';
+import JobSuspendButton from './JobSuspendButton';
+import { jobSuspendKey } from './jobSuspendState';
 import { makeJobStatusLabel } from './List';
 
 export default function JobDetails(props: { name?: string; namespace?: string; cluster?: string }) {
@@ -68,6 +70,10 @@ export default function JobDetails(props: { name?: string; namespace?: string; c
       actions={item =>
         item
           ? [
+              {
+                id: 'suspend',
+                action: <JobSuspendButton key={jobSuspendKey(item)} item={item} />,
+              },
               {
                 id: 'logs',
                 action: <LogsButton key="logs" item={item} />,
@@ -159,6 +165,28 @@ export default function JobDetails(props: { name?: string; namespace?: string; c
             name: t('translation|TTL After Finished'),
             value: `${item.spec.ttlSecondsAfterFinished}s`,
             hide: item.spec?.ttlSecondsAfterFinished === undefined,
+          },
+          {
+            // Indexes are listed as ranges, for example "0,2-4".
+            name: t('glossary|Completed Indexes'),
+            value: item.status?.completedIndexes,
+            hide: !item.status?.completedIndexes,
+          },
+          {
+            // Set for Indexed Jobs with backoffLimitPerIndex.
+            name: t('glossary|Failed Indexes'),
+            value: item.status?.failedIndexes,
+            hide: !item.status?.failedIndexes,
+          },
+          {
+            name: t('glossary|Backoff Limit Per Index'),
+            value: item.spec?.backoffLimitPerIndex,
+            hide: item.spec?.backoffLimitPerIndex === undefined,
+          },
+          {
+            name: t('glossary|Max Failed Indexes'),
+            value: item.spec?.maxFailedIndexes,
+            hide: item.spec?.maxFailedIndexes === undefined,
           },
         ];
       }}

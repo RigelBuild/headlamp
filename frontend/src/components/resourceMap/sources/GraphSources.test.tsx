@@ -39,7 +39,10 @@ const object = (uid: string, ownerReferences?: { uid: string }[]) =>
 const source = (
   id: string,
   data: { nodes?: GraphNode[]; edges?: GraphEdge[] } | null,
-  options: { enabled?: boolean; hook?: ReturnType<typeof vi.fn> } = {}
+  options: {
+    enabled?: boolean;
+    hook?: () => { nodes?: GraphNode[]; edges?: GraphEdge[] } | null;
+  } = {}
 ): GraphSource => ({
   id,
   label: id.toUpperCase(),
@@ -216,6 +219,29 @@ describe('GraphSourceManager', () => {
     expect(context.nodes.map(node => node.id)).toEqual(['settled-node']);
 
     vi.useRealTimers();
+  });
+
+  it('stops loading when a group that is still loading goes away', async () => {
+    const settled = source('settled', { nodes: [{ id: 'settled-node' }] });
+    const devices = { id: 'devices', label: 'Devices', sources: [source('pending', null)] };
+
+    const { rerender } = render(
+      <GraphSourceManager sources={[settled, devices]} relations={[]}>
+        <Probe />
+      </GraphSourceManager>
+    );
+
+    await waitFor(() => expect(context.sourceData?.get('pending')).toBeNull());
+    expect(context.isLoading).toBe(true);
+
+    rerender(
+      <GraphSourceManager sources={[settled]} relations={[]}>
+        <Probe />
+      </GraphSourceManager>
+    );
+
+    await waitFor(() => expect(context.isLoading).toBe(false));
+    expect(context.nodes.map(node => node.id)).toEqual(['settled-node']);
   });
 
   it('restarts the timeout when a source later re-enters a null loading state', async () => {

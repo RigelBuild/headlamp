@@ -303,6 +303,7 @@ export default function NodeDetails(props: { name?: string; cluster?: string }) 
             pods={nodePods}
             metrics={nodeMetrics}
             noMetrics={noMetrics}
+            metricsError={metricsError}
             summaryStats={nodeSummaryStats}
             summaryError={nodeSummaryError}
           />
@@ -353,13 +354,10 @@ export default function NodeDetails(props: { name?: string; cluster?: string }) 
           if (!item) return [];
           const roles = item.getRoles();
           const nodePool = item.getNodePool();
-          // The keys of interest are reported by the API in kebab-case.
-          const reportedKeys = ['cpu', 'memory', 'pods', 'ephemeral-storage'];
-          const pickResources = (res: { [key: string]: string } = {}) =>
-            Object.fromEntries(reportedKeys.filter(key => res[key]).map(key => [key, res[key]]));
+          const pickResources = (res: { [key: string]: string } = {}) => res;
+
           const capacity = pickResources(item.status?.capacity);
           const allocatable = pickResources(item.status?.allocatable);
-
           return [
             {
               name: t('translation|Roles'),
@@ -434,10 +432,11 @@ interface ChartsSectionProps {
   summaryStats: KubeNodeSummaryStats | null;
   summaryError: ApiError | null;
   noMetrics?: boolean;
+  metricsError?: ApiError | null;
 }
 
 function ChartsSection(props: ChartsSectionProps) {
-  const { node, pods, metrics, summaryStats, summaryError, noMetrics } = props;
+  const { node, pods, metrics, summaryStats, summaryError, noMetrics, metricsError } = props;
   const { t } = useTranslation('glossary');
 
   function getUptime() {
@@ -478,13 +477,19 @@ function ChartsSection(props: ChartsSectionProps) {
           </Paper>
         </Box>
         <Box>
-          <CpuCircularChart items={node && [node]} itemsMetrics={metrics} noMetrics={noMetrics} />
+          <CpuCircularChart
+            items={node && [node]}
+            itemsMetrics={metrics}
+            noMetrics={noMetrics}
+            metricsError={metricsError}
+          />
         </Box>
         <Box>
           <MemoryCircularChart
             items={node && [node]}
             itemsMetrics={metrics}
             noMetrics={noMetrics}
+            metricsError={metricsError}
           />
         </Box>
         <Box>
@@ -547,6 +552,15 @@ function AllocatedResourcesSection(props: { node: Node; pods: KubePod[] | null }
         podMemoryRequests = Math.max(podMemoryRequests, initMemReq);
         podMemoryLimits = Math.max(podMemoryLimits, initMemLimit);
       });
+
+      // Overhead applies to the effective pod total, after accounting for init
+      // containers. Kubernetes adds it to limits only when that limit is nonzero.
+      const overheadCpu = units.parseCpu(pod.spec.overhead?.cpu || '0');
+      const overheadMemory = units.parseRam(pod.spec.overhead?.memory || '0');
+      podCpuRequests += overheadCpu;
+      podMemoryRequests += overheadMemory;
+      if (podCpuLimits > 0) podCpuLimits += overheadCpu;
+      if (podMemoryLimits > 0) podMemoryLimits += overheadMemory;
 
       reqCpu += podCpuRequests;
       limCpu += podCpuLimits;

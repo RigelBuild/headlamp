@@ -1,3 +1,19 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package kubeconfig_test
 
 import (
@@ -27,6 +43,8 @@ func TestContextStore(t *testing.T) {
 	contexts, err := store.GetContexts()
 	require.NoError(t, err)
 	require.Equal(t, 2, len(contexts))
+	require.Equal(t, "test", contexts[0].Name)
+	require.Equal(t, "test2", contexts[1].Name)
 
 	// Test GetContext
 	_, err = store.GetContext("non-existent-context")
@@ -69,6 +87,26 @@ func TestContextStore(t *testing.T) {
 	_, err = store.GetContext("testwithttl")
 	require.Error(t, err)
 	require.Equal(t, cache.ErrNotFound, err)
+}
+
+func TestContextStoreConditionalUpdate(t *testing.T) {
+	store := kubeconfig.NewContextStore()
+	original := &kubeconfig.Context{Name: "test", ClusterID: "file+test"}
+	require.NoError(t, store.AddContext(original))
+	updated := original.Copy()
+	require.NoError(t, store.UpdateContextIfCurrent(original, updated))
+	require.Error(t, store.UpdateContextIfCurrent(original, original.Copy()))
+
+	replacement := &kubeconfig.Context{Name: "test", ClusterID: "other+test"}
+	require.NoError(t, store.AddContext(replacement))
+	require.Error(t, store.UpdateContextIfCurrent(updated, original.Copy()))
+	current, err := store.GetContext("test")
+	require.NoError(t, err)
+	require.Same(t, replacement, current)
+	require.NoError(t, store.RemoveContext("test"))
+	require.ErrorIs(t, store.UpdateContextIfCurrent(replacement, original.Copy()), cache.ErrNotFound)
+	_, err = store.GetContext("test")
+	require.ErrorIs(t, err, cache.ErrNotFound)
 }
 
 func TestContextStoreListeners(t *testing.T) {
@@ -132,9 +170,33 @@ func TestContextStoreGetContextKeys(t *testing.T) {
 
 	keys, err = store.GetContextKeys()
 	require.NoError(t, err)
-	require.Len(t, keys, 2)
-	require.Contains(t, keys, "test-key-1")
-	require.Contains(t, keys, "test-key-2")
+	require.Equal(t, []string{"test-key-1", "test-key-2"}, keys)
+}
+
+func TestContextStoreReturnsSortedContextsAndKeys(t *testing.T) {
+	store := kubeconfig.NewContextStore()
+
+	err := store.AddContext(&kubeconfig.Context{Name: "cluster-c"})
+	require.NoError(t, err)
+
+	err = store.AddContext(&kubeconfig.Context{Name: "cluster-a"})
+	require.NoError(t, err)
+
+	err = store.AddContext(&kubeconfig.Context{Name: "cluster-b"})
+	require.NoError(t, err)
+
+	contexts, err := store.GetContexts()
+	require.NoError(t, err)
+	require.Len(t, contexts, 3)
+	require.Equal(t, []string{"cluster-a", "cluster-b", "cluster-c"}, []string{
+		contexts[0].Name,
+		contexts[1].Name,
+		contexts[2].Name,
+	})
+
+	keys, err := store.GetContextKeys()
+	require.NoError(t, err)
+	require.Equal(t, []string{"cluster-a", "cluster-b", "cluster-c"}, keys)
 }
 
 func TestAddContextWithHeadlampInfo(t *testing.T) {

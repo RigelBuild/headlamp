@@ -38,14 +38,19 @@ export function parseRam(value: string) {
 function parseUnitsOfBytes(value: string): number {
   if (!value) return 0;
 
-  // "m" suffix means milli-bytes (1/1000 of a byte), e.g. "11973899059200m" from kubectl
-  // Support integer and decimal milli-byte values like "1000m" or "1.5m"
-  if (/^\d+(?:\.\d+)?m$/.test(value)) {
-    return parseFloat(value.slice(0, -1)) / 1000;
+  // Fractional byte suffixes are milli (m), micro (u), and nano (n).
+  // Support integer and decimal quantities without matching other suffixes.
+  if (/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)[mun]$/.test(value)) {
+    const divisor = value.endsWith('n') ? 1e9 : value.endsWith('u') ? 1e6 : 1000;
+    return parseFloat(value) / divisor;
   }
 
-  const groups = value.match(/(\d+(?:\.\d+)?)([BKMGTPEe])?(i)?(\d+)?/) || [];
-  const number = parseFloat(groups[1]);
+  // Kubernetes spells kilo with a lowercase k in the decimal suffixes
+  // (m | "" | k | M | G | T | P | E), so 1k is 1000 while 1Ki is 1024. The
+  // uppercase K is not a valid suffix, but it has been read as kilo here for a
+  // long time, so it stays accepted.
+  const groups = value.match(/(\d+(?:\.\d+)?)([BkKMGTPEe])?(i)?(\d+)?/) || [];
+  const number = parseFloat(groups[1]) * (value.startsWith('-') ? -1 : 1);
 
   // number ex. 1000
   if (groups[2] === undefined) {
@@ -57,7 +62,13 @@ function parseUnitsOfBytes(value: string): number {
     return number * 10 ** parseInt(groups[4], 10);
   }
 
-  const unitIndex = _.indexOf(UNITS, groups[2]);
+  // The binary suffixes are Ki, Mi, Gi and so on, all with an uppercase letter.
+  // There is no lowercase ki, so it is left unparsed rather than read as 1024.
+  if (groups[2] === 'k' && groups[3] !== undefined) {
+    return number;
+  }
+
+  const unitIndex = _.indexOf(UNITS, groups[2] === 'k' ? 'K' : groups[2]);
 
   // Unit + i ex. 1Ki
   if (groups[3] !== undefined) {
@@ -115,8 +126,11 @@ export function divideK8sResources(
   b: string,
   resourceType: 'cpu' | 'memory' = 'memory'
 ): number {
-  if (resourceType === 'cpu') {
-    return parseCpu(a) / parseCpu(b);
+  const divisor = resourceType === 'cpu' ? parseCpu(b) : parseUnitsOfBytes(b);
+  if (divisor <= 0 || !Number.isFinite(divisor)) {
+    throw new Error(`Divisor must be greater than 0: ${b}`);
   }
-  return parseUnitsOfBytes(a) / parseUnitsOfBytes(b);
+
+  const dividend = resourceType === 'cpu' ? parseCpu(a) : parseUnitsOfBytes(a);
+  return dividend / divisor;
 }

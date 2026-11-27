@@ -32,13 +32,20 @@ import * as Utils from './lib/util';
 import { Headlamp, Plugin } from './plugin/lib';
 import { getSupportedLocales, isLocaleSupported, useTranslation } from './plugin/pluginI18n';
 import { PluginSettingsDetailsProps } from './plugin/pluginsSlice';
-import type { CallbackActionOptions, HeadlampEvent, Relation } from './plugin/registry';
+import type {
+  AppThemeRegistrationOptions,
+  CallbackActionOptions,
+  HeadlampEvent,
+  PluginRunCommand,
+  Relation,
+} from './plugin/registry';
 import Registry, {
   AppLogoProps,
   clusterAction,
   ClusterChooserProps,
   ConfigStore,
   DefaultAppBarAction,
+  DefaultCreateProject,
   DefaultDetailsViewSection,
   DefaultHeadlampEvents,
   DefaultSidebars,
@@ -52,6 +59,7 @@ import Registry, {
   registerAppTheme,
   registerClusterChooser,
   registerClusterEmptyState,
+  registerClusterProviderDeleteHandler,
   registerClusterProviderDialog,
   registerClusterProviderMenuItem,
   registerClusterStatus,
@@ -71,6 +79,7 @@ import Registry, {
   registerProjectApiResource,
   registerProjectDeleteButton,
   registerProjectDetailsTab,
+  registerProjectGrouping,
   registerProjectHeaderAction,
   registerProjectOverviewSection,
   registerResourceRelationProvider,
@@ -82,7 +91,7 @@ import Registry, {
   registerUIPanel,
   runCommand,
 } from './plugin/registry';
-import type { ClusterEmptyStateProps } from './redux/clusterProviderSlice';
+import type { ClusterDeleteHandler, ClusterEmptyStateProps } from './redux/clusterProviderSlice';
 export type { ApiResource } from './plugin/registry';
 
 // We export k8s (lowercase) since someone may use it as we do in the Headlamp source code.
@@ -99,6 +108,7 @@ export {
   Headlamp,
   Notification,
   DefaultAppBarAction,
+  DefaultCreateProject,
   DefaultDetailsViewSection,
   DefaultHeadlampEvents,
   DetailsViewDefaultHeaderActions,
@@ -123,6 +133,7 @@ export {
   clusterAction,
   runCommand,
   registerAddClusterProvider,
+  registerClusterProviderDeleteHandler,
   registerClusterProviderDialog,
   registerClusterProviderMenuItem,
   registerHeadlampEventCallback,
@@ -139,6 +150,7 @@ export {
   getSupportedLocales,
   registerCustomCreateProject,
   registerProjectDetailsTab,
+  registerProjectGrouping,
   registerProjectOverviewSection,
   registerProjectHeaderAction,
   registerClusterStatus,
@@ -150,12 +162,15 @@ export {
 export type {
   AppLogoProps,
   AppTheme,
+  AppThemeRegistrationOptions,
   PluginSettingsDetailsProps,
   CallbackActionOptions,
   ClusterChooserProps,
+  ClusterDeleteHandler,
   ClusterEmptyStateProps,
   DetailsViewSectionProps,
   DefaultSidebars,
   HeadlampEvent,
+  PluginRunCommand,
   Relation,
 };

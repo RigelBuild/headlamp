@@ -25,6 +25,7 @@ import WS from 'vitest-websocket-mock';
 import { getAppUrl } from '../../../../helpers/getAppUrl';
 import { setBackendToken } from '../../../../helpers/getHeadlampAPIHeaders';
 import * as cluster from '../../../cluster';
+import { encodeClusterPath } from '../../../oidcLogout';
 import * as apiProxy from '../../apiProxy';
 
 const baseApiUrl = getAppUrl();
@@ -186,11 +187,14 @@ describe('apiProxy', () => {
 
     it('auto-logs out after a 401 with a Headers authorization value', async () => {
       const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
-      nock(baseApiUrl).get(testPath).reply(401, errorResponse401);
-      const logoutRequest = nock(baseApiUrl).post('/clusters/set-token').reply(200);
+      nock(baseApiUrl).get(`/clusters/${clusterName}${testPath}`).reply(401, errorResponse401);
+      const logoutRequest = nock(baseApiUrl)
+        .post(`/encoded-clusters/${encodeClusterPath(clusterName)}/clear-token`)
+        .reply(200);
 
       await expect(
         apiProxy.clusterRequest(testPath, {
+          cluster: clusterName,
           headers: new Headers({ Authorization: '******' }),
         })
       ).rejects.toThrow(errorResponse401.error);
@@ -200,6 +204,22 @@ describe('apiProxy', () => {
         expect.objectContaining({ status: 401, path: testPath })
       );
       await vi.waitFor(() => expect(logoutRequest.isDone()).toBe(true));
+    });
+
+    it('does not auto-log out after a clusterless 401', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      nock(baseApiUrl).get(testPath).reply(401, errorResponse401);
+      const logoutRequest = nock(baseApiUrl)
+        .post(/\/encoded-clusters\/.*\/clear-token/)
+        .reply(200);
+
+      await expect(
+        apiProxy.clusterRequest(testPath, {
+          headers: new Headers({ Authorization: '******' }),
+        })
+      ).rejects.toThrow(errorResponse401.error);
+
+      expect(logoutRequest.isDone()).toBe(false);
     });
   });
 
@@ -250,6 +270,67 @@ describe('apiProxy', () => {
 
         server.send(JSON.stringify({ type: 'MODIFIED', object: modifiedConfigMap }));
         expect(cb).toHaveBeenNthCalledWith(3, [{ actionType: 'MODIFIED', ...modifiedConfigMap }]);
+      });
+
+      it('applies a MODIFIED event whose resourceVersion is distinct but collapses under parseInt', async () => {
+        const server = new WS(
+          `${wsUrl}clusters/${clusterName}/apis/${mockSingleResource[0]}/${mockSingleResource[1]}/${mockSingleResource[2]}`
+        );
+
+        const client = apiProxy.apiFactory(...mockSingleResource);
+        client.list(cb, errCb, {}, clusterName);
+
+        await server.connected;
+
+        // Two distinct resourceVersions above Number.MAX_SAFE_INTEGER that both
+        // parseInt() to the same number. resourceVersion is opaque, so the newer
+        // MODIFIED event must still be applied.
+        const addedObject = {
+          ...mockConfigMap,
+          metadata: { ...mockConfigMap.metadata, resourceVersion: '18014398509481984' },
+        };
+        const modifiedObject = {
+          ...mockConfigMap,
+          metadata: { ...mockConfigMap.metadata, resourceVersion: '18014398509481985' },
+          data: { ...mockConfigMap.data, volumeName: 'pvc-updated' },
+        };
+
+        server.send(JSON.stringify({ type: 'ADDED', object: addedObject }));
+        server.send(JSON.stringify({ type: 'MODIFIED', object: modifiedObject }));
+
+        expect(cb).toHaveBeenLastCalledWith([{ actionType: 'MODIFIED', ...modifiedObject }]);
+      });
+
+      it('applies a MODIFIED event even when the object has no resourceVersion', async () => {
+        const server = new WS(
+          `${wsUrl}clusters/${clusterName}/apis/${mockSingleResource[0]}/${mockSingleResource[1]}/${mockSingleResource[2]}`
+        );
+
+        const client = apiProxy.apiFactory(...mockSingleResource);
+        client.list(cb, errCb, {}, clusterName);
+
+        await server.connected;
+
+        const addedObject = {
+          ...mockConfigMap,
+          metadata: { ...mockConfigMap.metadata, resourceVersion: '1' },
+        };
+        // A MODIFIED event with no resourceVersion must still be applied, not dropped.
+        const modifiedObject = {
+          ...mockConfigMap,
+          metadata: { ...mockConfigMap.metadata, resourceVersion: undefined },
+          data: { ...mockConfigMap.data, volumeName: 'pvc-no-rv' },
+        };
+
+        server.send(JSON.stringify({ type: 'ADDED', object: addedObject }));
+        server.send(JSON.stringify({ type: 'MODIFIED', object: modifiedObject }));
+
+        expect(cb).toHaveBeenLastCalledWith([
+          expect.objectContaining({
+            actionType: 'MODIFIED',
+            data: expect.objectContaining({ volumeName: 'pvc-no-rv' }),
+          }),
+        ]);
       });
     });
 
@@ -1169,6 +1250,25 @@ describe('apiProxy', () => {
         );
         expect(response).toEqual(mockStartResponse);
       });
+
+      it('Normalizes leading-zero port numbers before sending', async () => {
+        await apiProxy.startPortForward(
+          clusterName,
+          namespace,
+          podName,
+          containerPort,
+          service,
+          serviceNamespace,
+          '08080',
+          baseApiUrl,
+          mockId
+        );
+
+        const fetchMock = global.fetch as MockedFunction<typeof fetch>;
+        const [, init] = fetchMock.mock.calls[0];
+        const sentBody = JSON.parse(String(init?.body));
+        expect(sentBody.port).toBe('8080');
+      });
     });
 
     describe('stopOrDeletePortForward', () => {
@@ -1230,7 +1330,8 @@ describe('apiProxy', () => {
 
         const [url, options] = (fetch as Mock).mock.lastCall!;
 
-        expect(url).toContain('drain-node');
+        expect(url).toBe(`${baseApiUrl}clusters/${clusterName}/drain-node`);
+        expect(options.credentials).toBe('include');
         expect(options.method).toBe('POST');
         expect(new Headers(options.headers).get('content-type')).toEqual('application/json');
         expect(new Headers(options.headers).get('X-HEADLAMP_BACKEND-TOKEN')).toEqual(
@@ -1262,7 +1363,10 @@ describe('apiProxy', () => {
 
         const [url, options] = (fetch as Mock).mock.lastCall!;
 
-        expect(url).toContain('drain-node-status');
+        expect(url).toBe(
+          `${baseApiUrl}clusters/${clusterName}/drain-node-status?nodeName=${nodeName}`
+        );
+        expect(options.credentials).toBe('include');
         expect(options.method).toBe('GET');
         expect(new Headers(options.headers).get('content-type')).toEqual('application/json');
         expect(new Headers(options.headers).get('X-HEADLAMP_BACKEND-TOKEN')).toEqual(

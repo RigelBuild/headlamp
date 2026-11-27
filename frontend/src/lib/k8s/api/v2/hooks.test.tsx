@@ -266,6 +266,100 @@ describe('useEndpoints', () => {
     expect(result.current.endpoint).toBeUndefined();
   });
 
+  it('tries the next candidate namespace when probing is forbidden in the first', async () => {
+    const endpoints: KubeObjectEndpoint[] = [
+      { group: 'gateway.networking.k8s.io', version: 'v1', resource: 'httproutes' },
+      { group: 'gateway.networking.k8s.io', version: 'v1beta1', resource: 'httproutes' },
+    ];
+
+    mockClusterFetch.mockImplementation(url => {
+      if (String(url).includes('/namespaces/a/')) {
+        return Promise.reject(new ApiError('Forbidden', { status: 403 }));
+      }
+      if (url === 'apis/gateway.networking.k8s.io/v1/namespaces/b/httproutes') {
+        return Promise.resolve(mockJsonResponse({}));
+      }
+
+      return Promise.reject(new ApiError('Not Found', { status: 404 }));
+    });
+
+    const { result } = renderHook(() => useEndpoints(endpoints, 'cluster-a', ['a', 'b']), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => {
+      expect(result.current.endpoint).toEqual(endpoints[0]);
+    });
+  });
+
+  it('stops candidate namespace fallback when probing is unauthorized', async () => {
+    const endpoints: KubeObjectEndpoint[] = [
+      { group: 'gateway.networking.k8s.io', version: 'v1', resource: 'httproutes' },
+      { group: 'gateway.networking.k8s.io', version: 'v1beta1', resource: 'httproutes' },
+    ];
+    mockClusterFetch.mockImplementation((url, options) => {
+      const endpoint = endpoints.find(
+        candidate =>
+          String(url) === `apis/${candidate.group}/${candidate.version}/namespaces/a/httproutes`
+      );
+      if (endpoint) {
+        return Promise.reject(new ApiError('Unauthorized', { status: 401 }));
+      }
+      return Promise.reject(new ApiError(`Unexpected ${options?.method}`, { status: 404 }));
+    });
+
+    const { result } = renderHook(() => useEndpoints(endpoints, 'cluster-a', ['a', 'b']), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.error).toMatchObject({ status: 401 }));
+    expect(mockClusterFetch).toHaveBeenCalledTimes(endpoints.length);
+    expect(
+      mockClusterFetch.mock.calls.every(([url]) => String(url).includes('/namespaces/a/'))
+    ).toBe(true);
+  });
+
+  it.each([
+    {
+      kind: 'namespaced',
+      endpoints: [
+        { group: 'gateway.networking.k8s.io', version: 'v1', resource: 'httproutes' },
+        { group: 'gateway.networking.k8s.io', version: 'v1beta1', resource: 'httproutes' },
+      ],
+      url: 'apis/gateway.networking.k8s.io/v1/httproutes',
+    },
+    {
+      kind: 'cluster-scoped',
+      endpoints: [
+        { group: 'gateway.networking.k8s.io', version: 'v1', resource: 'gatewayclasses' },
+        { group: 'gateway.networking.k8s.io', version: 'v1beta1', resource: 'gatewayclasses' },
+      ],
+      url: 'apis/gateway.networking.k8s.io/v1/gatewayclasses',
+    },
+  ])(
+    'probes the cluster-wide URL for an unfiltered $kind list',
+    async ({ endpoints, url: expectedUrl }) => {
+      mockClusterFetch.mockImplementation(url =>
+        url === expectedUrl
+          ? Promise.resolve(mockJsonResponse({}))
+          : Promise.reject(new ApiError('Not Found', { status: 404 }))
+      );
+
+      const { result } = renderHook(() => useEndpoints(endpoints, 'cluster-a', []), {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(result.current.endpoint).toEqual(endpoints[0]);
+      });
+      expect(mockClusterFetch).toHaveBeenCalledWith(expectedUrl, expect.anything());
+      expect(mockClusterFetch).not.toHaveBeenCalledWith(
+        expect.stringContaining('/namespaces/'),
+        expect.anything()
+      );
+    }
+  );
+
   it('handles non-ok response in list probing', async () => {
     const endpoints: KubeObjectEndpoint[] = [
       { group: 'batch', version: 'v1', resource: 'jobs' },
@@ -434,6 +528,54 @@ describe('useKubeObject watch wiring', () => {
       expect(lastCall.enabled).toBe(true);
       expect(lastCall.url()).toContain('namespaces/my-ns');
     });
+  });
+
+  it('keeps the requested cluster when a watch update replaces the object', async () => {
+    vi.stubEnv('REACT_APP_ENABLE_WEBSOCKET_MULTIPLEXER', 'false');
+    mockClusterFetch.mockResolvedValue(
+      mockJsonResponse({
+        apiVersion: 'v1',
+        kind: 'Pod',
+        metadata: { name: 'my-pod', namespace: 'my-ns', resourceVersion: '1' },
+      })
+    );
+
+    const { result } = renderHook(
+      () =>
+        useKubeObject({
+          kubeObjectClass: MockPod,
+          name: 'my-pod',
+          namespace: 'my-ns',
+          cluster: 'owner-cluster',
+        }),
+      { wrapper: createWrapper() }
+    );
+
+    await waitFor(() => {
+      expect(result.current.data?.cluster).toBe('owner-cluster');
+      expect(mockUseWebSockets.mock.calls.length).toBeGreaterThan(0);
+    });
+
+    const { connections } =
+      mockUseWebSockets.mock.calls[mockUseWebSockets.mock.calls.length - 1][0];
+    const onMessage = connections[0].onMessage;
+
+    // A MODIFIED event rebuilds the object. It has to carry the cluster the hook
+    // was asked for; otherwise it falls back to getCluster(), which reads the URL
+    // and does not know about the cluster passed in explicitly here.
+    onMessage({
+      type: 'MODIFIED',
+      object: {
+        apiVersion: 'v1',
+        kind: 'Pod',
+        metadata: { name: 'my-pod', namespace: 'my-ns', resourceVersion: '2' },
+      },
+    });
+
+    await waitFor(() => {
+      expect(result.current.data?.jsonData?.metadata?.resourceVersion).toBe('2');
+    });
+    expect(result.current.data?.cluster).toBe('owner-cluster');
   });
 
   it('re-subscribes to the new resource when navigating between resources of the same kind', async () => {

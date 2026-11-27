@@ -17,14 +17,17 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { setDiscoveredNamespaces } from '../../../../helpers/clusterSettings';
 import { ApiError } from './ApiError';
 import { clusterFetch } from './fetch';
 import {
   DEFAULT_LIST_LIMIT,
+  isWatchedListStillRequested,
   kubeObjectListQuery,
   ListResponse,
   makeListRequests,
+  matchesLabelSelectorString,
   useKubeObjectList,
   useWatchKubeObjectLists,
 } from './useKubeObjectList';
@@ -236,6 +239,62 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+describe('isWatchedListStillRequested', () => {
+  // Regression test for 9542b5cb5: an empty-string namespace means "all namespaces"
+  // for a namespaced resource and is a valid, meaningful value — but it is falsy, so
+  // a naive truthiness check (`!watching.namespace`) treats it the same as "no
+  // namespace at all" and incorrectly drops the watch entry. It must never get
+  // "cleaned up" just because it's an empty string.
+  it('should keep a watch entry with an empty-string namespace when still requested', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'default', namespaces: [''] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(true);
+  });
+
+  it('should drop a watch entry whose cluster is no longer requested', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'other-cluster', namespaces: [''] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(false);
+  });
+
+  it('should keep a watch entry with no namespace for a non-namespaced resource', () => {
+    const watching = { cluster: 'default', namespace: undefined };
+    const requests = [{ cluster: 'default', namespaces: undefined }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(true);
+  });
+
+  // A request with no namespace filter is served by kubeObjectListQuery with its
+  // default namespace of '', so the resulting watch entry carries '' rather than
+  // undefined. It still matches that request.
+  it('should keep a watch entry with an empty-string namespace when the request has no namespaces', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'default', namespaces: undefined }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(true);
+  });
+
+  it('should drop a watch entry whose namespace is no longer requested', () => {
+    const watching = { cluster: 'default', namespace: 'gone' };
+    const requests = [{ cluster: 'default', namespaces: ['kept'] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(false);
+  });
+
+  // The mirror image of the 9542b5cb5 regression: '' must not be read as "matches
+  // anything" either. Without this case, '' is never checked against a non-empty
+  // namespace list anywhere in the suite, so an implementation short-circuiting ''
+  // to a match would pass every other test here.
+  it('should drop a watch entry with an empty-string namespace when a specific namespace is requested', () => {
+    const watching = { cluster: 'default', namespace: '' };
+    const requests = [{ cluster: 'default', namespaces: ['default'] }];
+
+    expect(isWatchedListStillRequested(watching, requests)).toBe(false);
+  });
+});
+
 describe('useWatchKubeObjectLists', () => {
   beforeEach(() => {
     vi.stubEnv('REACT_APP_ENABLE_WEBSOCKET_MULTIPLEXER', 'false');
@@ -403,6 +462,47 @@ describe('useKubeObjectList', () => {
     localStorage.clear();
   });
 
+  it('updates combined freshness when identical cached lists are refreshed', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { staleTime: Infinity } },
+    });
+    const responses = ['a', 'b'].map(namespace => ({
+      list: makeListResponse(),
+      cluster: 'default',
+      namespace,
+    }));
+    const keys = responses.map(
+      response =>
+        kubeObjectListQuery(
+          mockClass,
+          { version: 'v1', resource: 'pods' },
+          response.namespace,
+          response.cluster,
+          {}
+        ).queryKey
+    );
+    queryClient.setQueryData(keys[0], responses[0], { updatedAt: 100 });
+    queryClient.setQueryData(keys[1], responses[1], { updatedAt: 200 });
+
+    const { result } = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: mockClass,
+          requests: [{ cluster: 'default', namespaces: ['a', 'b'] }],
+          watch: false,
+        }),
+      { wrapper: queryClientWrapper(queryClient) }
+    );
+    await waitFor(() => expect(result.current.dataUpdatedAt).toBe(100));
+
+    act(() => queryClient.setQueryData(keys[0], responses[0], { updatedAt: 300 }));
+    await waitFor(() => expect(result.current.dataUpdatedAt).toBe(200));
+    act(() => queryClient.setQueryData(keys[1], responses[1], { updatedAt: 400 }));
+    await waitFor(() => expect(result.current.dataUpdatedAt).toBe(300));
+    expect(result.current.items).toEqual([]);
+    expect(mockClusterFetch).not.toHaveBeenCalled();
+  });
+
   it('returns an empty result without fetching when no list requests are allowed', () => {
     const result = renderHook(
       () =>
@@ -441,6 +541,125 @@ describe('useKubeObjectList', () => {
     );
 
     await waitFor(() => expect(mockClusterFetch).not.toHaveBeenCalled());
+  });
+
+  describe('with discovered namespaces', () => {
+    const namespaceClass = class {
+      static apiVersion = 'v1';
+      static apiName = 'namespaces';
+      static kind = 'Namespace';
+      cluster?: string;
+
+      constructor(public jsonData: any) {}
+    } as any;
+
+    function namespaceQuery() {
+      return kubeObjectListQuery(
+        namespaceClass,
+        { version: 'v1', resource: 'namespaces' },
+        undefined,
+        'restricted',
+        {}
+      );
+    }
+
+    afterEach(() => {
+      setDiscoveredNamespaces('restricted', null);
+    });
+
+    it('lists discovered namespaces and leaves out the ones the user may not get', async () => {
+      setDiscoveredNamespaces('restricted', ['team-a', 'team-b']);
+      mockClusterFetch
+        .mockResolvedValueOnce({
+          json: () => Promise.resolve({ metadata: { name: 'team-a', uid: 'a' } }),
+        } as Response)
+        .mockRejectedValueOnce(new ApiError('Forbidden', { status: 403 }));
+
+      const query = namespaceQuery();
+      const response = await (query.queryFn as any)();
+      const items = response.list.items as Array<{ cluster: string; jsonData: any }>;
+
+      expect(query.queryKey).toContainEqual(
+        expect.objectContaining({ discoveredNamespaces: ['team-a', 'team-b'] })
+      );
+      // No objects without a uid are made up for namespaces the user cannot read.
+      expect(items.map(item => item.jsonData.metadata.name)).toEqual(['team-a']);
+      expect(items[0].jsonData.metadata.uid).toBe('a');
+      expect(items[0].cluster).toBe('restricted');
+    });
+
+    it('refreshes discovered namespace metadata and preserves an explicit interval', () => {
+      setDiscoveredNamespaces('restricted', ['team-a']);
+
+      expect(namespaceQuery().refetchInterval).toBe(60 * 1000);
+      expect(
+        kubeObjectListQuery(
+          namespaceClass,
+          { version: 'v1', resource: 'namespaces' },
+          undefined,
+          'restricted',
+          {},
+          1234
+        ).refetchInterval
+      ).toBe(1234);
+    });
+
+    it('propagates other errors for discovered namespaces', async () => {
+      setDiscoveredNamespaces('restricted', ['team-a']);
+      mockClusterFetch.mockRejectedValueOnce(new ApiError('Boom', { status: 500 }));
+
+      await expect((namespaceQuery().queryFn as any)()).rejects.toMatchObject({
+        status: 500,
+        cluster: 'restricted',
+        namespace: 'team-a',
+      });
+    });
+
+    it('applies the requested label selector to discovered namespaces', async () => {
+      setDiscoveredNamespaces('restricted', ['team-a', 'team-b', 'team-c']);
+      mockClusterFetch
+        .mockResolvedValueOnce({
+          json: () =>
+            Promise.resolve({ metadata: { name: 'team-a', labels: { team: 'frontend' } } }),
+        } as Response)
+        .mockResolvedValueOnce({
+          json: () =>
+            Promise.resolve({ metadata: { name: 'team-b', labels: { team: 'backend' } } }),
+        } as Response)
+        // Not readable: left out.
+        .mockRejectedValueOnce(new ApiError('Forbidden', { status: 403 }));
+
+      const query = kubeObjectListQuery(
+        namespaceClass,
+        { version: 'v1', resource: 'namespaces' },
+        undefined,
+        'restricted',
+        { labelSelector: 'team=frontend' }
+      );
+      const response = await (query.queryFn as any)();
+
+      expect(response.list.items.map((item: any) => item.jsonData.metadata.name)).toEqual([
+        'team-a',
+      ]);
+    });
+
+    it('ignores discovered namespaces when namespaces are configured', async () => {
+      localStorage.setItem(
+        'cluster_settings.restricted',
+        JSON.stringify({ allowedNamespaces: ['manual'] })
+      );
+      setDiscoveredNamespaces('restricted', ['discovered']);
+      mockClusterFetch.mockResolvedValueOnce({
+        json: () => Promise.resolve({ metadata: { name: 'manual' } }),
+      } as Response);
+
+      const response = await (namespaceQuery().queryFn as any)();
+
+      expect(mockClusterFetch).toHaveBeenCalledTimes(1);
+      expect(response.list.items.map((item: any) => item.jsonData.metadata.name)).toEqual([
+        'manual',
+      ]);
+    });
   });
 
   it('fetches allowed namespaces individually without starting a cluster-wide watch', async () => {
@@ -793,6 +1012,206 @@ describe('useKubeObjectList', () => {
     });
   });
 
+  it('lists Secrets as a Table without transferring values, preserving type and data count', async () => {
+    const secretClass = class {
+      static kind = 'Secret';
+      static apiVersion = 'v1';
+      static apiName = 'secrets';
+      constructor(public jsonData: any) {}
+    } as any;
+    mockClusterFetch.mockResolvedValueOnce({
+      json: () =>
+        Promise.resolve({
+          kind: 'Table',
+          metadata: { resourceVersion: '12' },
+          columnDefinitions: [{ name: 'Name' }, { name: 'Type' }, { name: 'Data' }],
+          rows: [
+            {
+              cells: ['my-secret', 'Opaque', 2],
+              object: { metadata: { name: 'my-secret', namespace: 'default', uid: 'one' } },
+            },
+          ],
+        }),
+    } as Response);
+
+    const query = kubeObjectListQuery(
+      secretClass,
+      { version: 'v1', resource: 'secrets' },
+      'default',
+      'my-cluster',
+      {},
+      undefined,
+      true
+    );
+    const response = await (query.queryFn as any)();
+
+    expect(mockClusterFetch).toHaveBeenCalledWith('api/v1/namespaces/default/secrets', {
+      cluster: 'my-cluster',
+      headers: { Accept: 'application/json;as=Table;g=meta.k8s.io;v=v1,application/json;q=0.9' },
+    });
+    expect(response.list.metadata.resourceVersion).toBe('12');
+    expect(response.list.items[0].jsonData).toEqual({
+      kind: 'Secret',
+      apiVersion: 'v1',
+      metadata: { name: 'my-secret', namespace: 'default', uid: 'one' },
+      type: 'Opaque',
+      dataCount: 2,
+      data: {},
+    });
+  });
+
+  it('does not watch a Table list even without a polling interval', async () => {
+    const secretClass = class {
+      static kind = 'Secret';
+      static apiVersion = 'v1';
+      static apiName = 'secrets';
+      static apiEndpoint = { apiInfo: [{ group: '', resource: 'secrets', version: 'v1' }] };
+      constructor(public jsonData: any) {}
+    } as any;
+    mockClusterFetch.mockResolvedValueOnce({
+      json: () =>
+        Promise.resolve({
+          kind: 'Table',
+          metadata: { resourceVersion: '12' },
+          columnDefinitions: [{ name: 'Name' }, { name: 'Type' }, { name: 'Data' }],
+          rows: [
+            {
+              cells: ['my-secret', 'Opaque', 2],
+              object: { metadata: { name: 'my-secret', namespace: 'default' } },
+            },
+          ],
+        }),
+    } as Response);
+
+    const result = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: secretClass,
+          requests: [{ cluster: 'default' }],
+          asTable: true,
+        }),
+      { wrapper: queryClientWrapper(new QueryClient()) }
+    );
+    await waitFor(() => expect(result.result.current.items?.length).toBe(1));
+    expect(mockUseWebSockets.mock.calls.at(-1)?.[0].connections).toEqual([]);
+  });
+
+  it('converts a subsequent page of Secret Table rows without fetching secret values', async () => {
+    const secretClass = class {
+      static kind = 'Secret';
+      static apiVersion = 'v1';
+      static apiName = 'secrets';
+      static apiEndpoint = { apiInfo: [{ group: '', resource: 'secrets', version: 'v1' }] };
+      constructor(public jsonData: any) {}
+    } as any;
+    const makeSecretTable = (name: string, token?: string) => ({
+      kind: 'Table',
+      metadata: { resourceVersion: '12', continue: token },
+      columnDefinitions: [{ name: 'Name' }, { name: 'Type' }, { name: 'Data' }],
+      rows: [
+        {
+          cells: [name, 'Opaque', 2],
+          object: { metadata: { name, namespace: 'default', uid: name } },
+        },
+      ],
+    });
+    mockClusterFetch
+      .mockResolvedValueOnce({
+        json: () => Promise.resolve(makeSecretTable('first', 'next')),
+      } as Response)
+      .mockResolvedValueOnce({
+        json: () => Promise.resolve(makeSecretTable('second')),
+      } as Response);
+    const result = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: secretClass,
+          requests: [{ cluster: 'default' }],
+          queryParams: { limit: 1 },
+          refetchInterval: 60_000,
+          asTable: true,
+        }),
+      { wrapper: queryClientWrapper(new QueryClient()) }
+    );
+    await waitFor(() => expect(result.result.current.items?.length).toBe(1));
+    await act(async () => {
+      await result.result.current.loadMore?.();
+    });
+    await waitFor(() => expect(result.result.current.items?.length).toBe(2));
+    expect(result.result.current.items?.map(item => item.jsonData.metadata.name)).toEqual([
+      'first',
+      'second',
+    ]);
+    expect(mockClusterFetch.mock.calls[1][0]).toBe('api/v1/secrets?limit=1&continue=next');
+    expect(new Headers(mockClusterFetch.mock.calls[1][1]?.headers).get('Accept')).toContain(
+      'as=Table'
+    );
+    expect(mockUseWebSockets.mock.calls.at(-1)?.[0].connections).toEqual([]);
+  });
+
+  it('does not treat a malformed Secret Table as an empty Secret list', async () => {
+    const secretClass = class {
+      static kind = 'Secret';
+      static apiVersion = 'v1';
+      static apiName = 'secrets';
+      constructor(public jsonData: any) {}
+    } as any;
+    mockClusterFetch.mockResolvedValueOnce({
+      json: () =>
+        Promise.resolve({
+          kind: 'Table',
+          metadata: { resourceVersion: '12' },
+          columnDefinitions: [{ name: 'Name' }, { name: 'Type' }],
+          rows: [{ cells: ['my-secret', 'Opaque'], object: { metadata: { name: 'my-secret' } } }],
+        }),
+    } as Response);
+    const query = kubeObjectListQuery(
+      secretClass,
+      { version: 'v1', resource: 'secrets' },
+      undefined,
+      'my-cluster',
+      {},
+      undefined,
+      true
+    );
+    await expect((query.queryFn as any)()).rejects.toThrow('lacks expected columns');
+  });
+
+  it('uses ordinary SecretLists when a cluster does not support Table responses', async () => {
+    const secretClass = class {
+      static kind = 'Secret';
+      static apiVersion = 'v1';
+      static apiName = 'secrets';
+      constructor(public jsonData: any) {}
+    } as any;
+    mockClusterFetch.mockResolvedValueOnce({
+      json: () =>
+        Promise.resolve(
+          makeListResponse({
+            kind: 'SecretList',
+            items: [
+              {
+                metadata: { name: 'my-secret' },
+                type: 'Opaque',
+                data: { foo: 'YmFy' },
+              },
+            ],
+          })
+        ),
+    } as Response);
+    const query = kubeObjectListQuery(
+      secretClass,
+      { version: 'v1', resource: 'secrets' },
+      undefined,
+      'my-cluster',
+      {},
+      undefined,
+      true
+    );
+    const response = await (query.queryFn as any)();
+    expect(response.list.items[0].jsonData.data).toEqual({ foo: 'YmFy' });
+  });
+
   it('should not fetch when no endpoint is available', async () => {
     const query = kubeObjectListQuery(mockClass, undefined as any, undefined, 'default', {});
 
@@ -965,6 +1384,30 @@ describe('useKubeObjectList', () => {
     );
   });
 
+  it('keeps ordinary Secret list consumers on the full-object response and a distinct cache key', async () => {
+    const secretClass = class {
+      static kind = 'Secret';
+      static apiVersion = 'v1';
+      static apiName = 'secrets';
+      constructor(public jsonData: any) {}
+    } as any;
+    mockClusterFetch.mockResolvedValueOnce({
+      json: () => Promise.resolve(makeListResponse({ kind: 'SecretList', items: [] })),
+    } as Response);
+    const args = [
+      secretClass,
+      { version: 'v1', resource: 'secrets' },
+      undefined,
+      'my-cluster',
+      {},
+    ] as const;
+    const fullQuery = kubeObjectListQuery(...args);
+    const tableQuery = kubeObjectListQuery(...args, undefined, true);
+    await (fullQuery.queryFn as any)();
+    expect(mockClusterFetch).toHaveBeenCalledWith('api/v1/secrets', { cluster: 'my-cluster' });
+    expect(fullQuery.queryKey).not.toEqual(tableQuery.queryKey);
+  });
+
   it('should split an opt-in limit across namespace requests', async () => {
     mockClusterFetch
       .mockResolvedValueOnce({
@@ -990,6 +1433,126 @@ describe('useKubeObjectList', () => {
 
     expect(mockClusterFetch.mock.calls[0][0]).toBe('api/v1/namespaces/a/pods?limit=500');
     expect(mockClusterFetch.mock.calls[1][0]).toBe('api/v1/namespaces/b/pods?limit=500');
+  });
+
+  it('should keep every namespace in clusterResults when a cluster has several', async () => {
+    mockClusterFetch
+      .mockResolvedValueOnce({
+        json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-a', '1')] })),
+      } as Response)
+      .mockResolvedValueOnce({
+        json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-b', '1')] })),
+      } as Response);
+
+    const { result } = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: mockClass,
+          requests: [{ cluster: 'default', namespaces: ['a', 'b'] }],
+        }),
+      {
+        wrapper: queryClientWrapper(new QueryClient()),
+      }
+    );
+
+    await waitFor(() => expect(result.current.items).toHaveLength(2));
+
+    const names = (items: any[] | null | undefined) =>
+      items?.map(item => item.jsonData.metadata.name);
+    expect(names(result.current.items)).toEqual(['pod-a', 'pod-b']);
+    expect(names(result.current.clusterResults?.default.items)).toEqual(['pod-a', 'pod-b']);
+    expect(result.current.clusterResults?.default.isSuccess).toBe(true);
+    expect(result.current.clusterResults?.default.status).toBe('success');
+  });
+
+  it('should report a namespace that failed in clusterResults', async () => {
+    const error = new ApiError('Forbidden', { status: 403 });
+    mockClusterFetch
+      .mockResolvedValueOnce({
+        json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-a', '1')] })),
+      } as Response)
+      .mockRejectedValueOnce(error);
+
+    const { result } = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: mockClass,
+          requests: [{ cluster: 'default', namespaces: ['a', 'b'] }],
+        }),
+      {
+        wrapper: queryClientWrapper(new QueryClient()),
+      }
+    );
+
+    await waitFor(() => expect(result.current.clusterResults?.default.isError).toBe(true));
+
+    const clusterResult = result.current.clusterResults!.default;
+    expect(clusterResult.items?.map(item => item.jsonData.metadata.name)).toEqual(['pod-a']);
+    expect(clusterResult.errors).toEqual([error]);
+    expect(clusterResult.isSuccess).toBe(false);
+    expect(clusterResult.status).toBe('error');
+  });
+
+  it('should report a namespace that is still loading in clusterResults', async () => {
+    const namespaceB = deferred<Response>();
+    mockClusterFetch
+      .mockResolvedValueOnce({
+        json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-a', '1')] })),
+      } as Response)
+      .mockReturnValueOnce(namespaceB.promise);
+
+    const { result } = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: mockClass,
+          requests: [{ cluster: 'default', namespaces: ['a', 'b'] }],
+        }),
+      {
+        wrapper: queryClientWrapper(new QueryClient()),
+      }
+    );
+
+    await waitFor(() => expect(result.current.clusterResults?.default.items).toHaveLength(1));
+    expect(result.current.clusterResults?.default.isLoading).toBe(true);
+    expect(result.current.clusterResults?.default.isSuccess).toBe(false);
+    expect(result.current.clusterResults?.default.status).toBe('pending');
+
+    namespaceB.resolve({
+      json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-b', '1')] })),
+    } as Response);
+
+    await waitFor(() => expect(result.current.clusterResults?.default.items).toHaveLength(2));
+    expect(result.current.clusterResults?.default.isLoading).toBe(false);
+    expect(result.current.clusterResults?.default.status).toBe('success');
+  });
+
+  it('should leave a cluster out of clusterResults until one of its namespaces has data', async () => {
+    const namespaceA = deferred<Response>();
+    const namespaceB = deferred<Response>();
+    mockClusterFetch
+      .mockReturnValueOnce(namespaceA.promise)
+      .mockReturnValueOnce(namespaceB.promise);
+
+    const { result } = renderHook(
+      () =>
+        useKubeObjectList({
+          kubeObjectClass: mockClass,
+          requests: [{ cluster: 'default', namespaces: ['a', 'b'] }],
+        }),
+      {
+        wrapper: queryClientWrapper(new QueryClient()),
+      }
+    );
+
+    // Home shows a cluster without an entry as still loading.
+    await waitFor(() => expect(mockClusterFetch).toHaveBeenCalledTimes(2));
+    expect(result.current.clusterResults?.default).toBeUndefined();
+
+    namespaceA.resolve({
+      json: () => Promise.resolve(makeListResponse({ items: [makePod('pod-a', '1')] })),
+    } as Response);
+
+    await waitFor(() => expect(result.current.clusterResults?.default.items).toHaveLength(1));
   });
 
   it('should not issue more initial namespace requests than the opt-in limit', async () => {
@@ -1483,6 +2046,36 @@ describe('useWatchKubeObjectLists (Multiplexer)', () => {
     expect(spy).toHaveBeenCalledWith({ enabled: false, connections: [] });
   });
 
+  it('should relist when the watch resource version expires', () => {
+    const queryClient = new QueryClient();
+    const endpoint = { version: 'v1', resource: 'pods' };
+    const queryKey = kubeObjectListQuery(mockClass, endpoint, 'a', 'default', {}).queryKey;
+    queryClient.setQueryData(queryKey, {
+      list: { items: [], metadata: { resourceVersion: '1' } },
+      cluster: 'default',
+    });
+    const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+
+    renderHook(
+      () =>
+        useWatchKubeObjectLists({
+          kubeObjectClass: mockClass,
+          endpoint,
+          lists: [{ cluster: 'default', namespace: 'a', resourceVersion: '1' }],
+        }),
+      { wrapper: queryClientWrapper(queryClient) }
+    );
+
+    const onMessage = mockSubscribe.mock.calls[0][3];
+    onMessage({
+      type: 'ERROR',
+      object: { kind: 'Status', metadata: {}, reason: 'Expired', code: 410 },
+    });
+
+    // The watch cannot report what changed since, such as deletions, so the list is fetched again.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey });
+  });
+
   it('should omit pagination query params after loading all pages', async () => {
     const queryClient = new QueryClient();
     mockClusterFetch
@@ -1534,5 +2127,36 @@ describe('useWatchKubeObjectLists (Multiplexer)', () => {
         )
       ).toBe(true)
     );
+  });
+});
+
+describe('matchesLabelSelectorString', () => {
+  const labels = { team: 'frontend', env: 'dev' };
+
+  it.each([
+    ['team=frontend', true],
+    ['team==frontend', true],
+    ['team=backend', false],
+    ['team!=backend', true],
+    ['team!=frontend', false],
+    ['missing!=x', true],
+    ['env in (dev,test)', true],
+    ['env in (prod)', false],
+    ['env notin (prod)', true],
+    ['missing notin (prod)', true],
+    ['team', true],
+    ['missing', false],
+    ['!missing', true],
+    ['!team', false],
+    ['team=frontend,env in (dev, test)', true],
+    ['team=frontend,env=prod', false],
+    ['', true],
+  ])('%s matches: %s', (selector, expected) => {
+    expect(matchesLabelSelectorString(selector, labels)).toBe(expected);
+  });
+
+  it('treats missing labels as no labels', () => {
+    expect(matchesLabelSelectorString('team=frontend', undefined)).toBe(false);
+    expect(matchesLabelSelectorString('!team', undefined)).toBe(true);
   });
 });

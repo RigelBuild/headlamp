@@ -26,6 +26,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -52,8 +53,10 @@ const (
 type PluginMetadata struct {
 	// Path is the URL path to access the plugin
 	Path string `json:"path"`
-	// Type indicates where the plugin comes from: "development", "user", or "shipped"
+	// Type controls plugin priority and migration behavior.
 	Type string `json:"type"`
+	// Source identifies the inventory root containing the plugin.
+	Source string `json:"source"`
 	// Name is the plugin's folder name
 	Name string `json:"name"`
 }
@@ -249,9 +252,10 @@ func GeneratePluginPaths(
 	for _, pluginURL := range pluginListURLStatic {
 		pluginName := filepath.Base(pluginURL)
 		pluginList = append(pluginList, PluginMetadata{
-			Path: pluginURL,
-			Type: "shipped",
-			Name: pluginName,
+			Path:   pluginURL,
+			Type:   PluginTypeShipped,
+			Source: PluginTypeShipped,
+			Name:   pluginName,
 		})
 	}
 
@@ -259,9 +263,10 @@ func GeneratePluginPaths(
 	for _, pluginURL := range pluginListURLUser {
 		pluginName := filepath.Base(pluginURL)
 		pluginList = append(pluginList, PluginMetadata{
-			Path: pluginURL,
-			Type: "user",
-			Name: pluginName,
+			Path:   pluginURL,
+			Type:   PluginTypeUser,
+			Source: PluginTypeUser,
+			Name:   pluginName,
 		})
 	}
 
@@ -284,9 +289,10 @@ func GeneratePluginPaths(
 		}
 
 		pluginList = append(pluginList, PluginMetadata{
-			Path: pluginURL,
-			Type: pluginType,
-			Name: pluginName,
+			Path:   pluginURL,
+			Type:   pluginType,
+			Source: PluginTypeDevelopment,
+			Name:   pluginName,
 		})
 	}
 
@@ -314,7 +320,8 @@ func isCatalogInstalledPlugin(pluginDir, pluginName string) bool {
 
 	packageJSONPath := filepath.Join(pluginPath, "package.json")
 
-	content, err := os.ReadFile(packageJSONPath) //nolint:gosec
+	//nolint:gosec // Plugin path is validated to stay within plugins directory
+	content, err := os.ReadFile(packageJSONPath)
 	if err != nil {
 		return false
 	}
@@ -671,5 +678,39 @@ func isSubdirectory(parentDir, dirPath string) bool {
 		return false
 	}
 
-	return !strings.HasPrefix(rel, "..") && !strings.HasPrefix(rel, ".")
+	// filepath.Rel reports "." when the two paths are the same directory. A directory
+	// is not a subdirectory of itself, and returning true here would let an empty
+	// plugin name resolve to the plugin root.
+	if rel == "." {
+		return false
+	}
+
+	// filepath.IsLocal answers the question this guard is actually asking: does the
+	// path stay inside the tree it is relative to. It inspects path components, so a
+	// directory named "..foo" is recognised as a child while a real escape, which
+	// always produces a ".." component, is rejected.
+	if !filepath.IsLocal(rel) {
+		return false
+	}
+
+	// On Windows, Win32 strips trailing dots and spaces from path components,
+	// turning names like "..." or ". " into "." or ".." and allowing deletion
+	// of the plugin root itself.
+	if runtime.GOOS == "windows" && hasWindowsDotAlias(rel) {
+		return false
+	}
+
+	return true
+}
+
+func hasWindowsDotAlias(rel string) bool {
+	for _, part := range strings.FieldsFunc(rel, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if strings.TrimRight(part, ". ") == "" {
+			return true
+		}
+	}
+
+	return false
 }

@@ -38,7 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-//nolint:funlen
+//nolint:funlen // Table-driven test with multiple cluster configurations
 func TestStatelessClustersKubeConfig(t *testing.T) {
 	kubeConfigByte, err := os.ReadFile("./headlamp_testdata/kubeconfig")
 	require.NoError(t, err)
@@ -88,7 +88,7 @@ func TestStatelessClustersKubeConfig(t *testing.T) {
 					Cache: cache,
 				},
 			}
-			handler := createHeadlampHandler(context.Background(), &c)
+			handler := createHeadlampHandler(newTestHandlerCtx(t), &c)
 
 			for _, clusterReq := range tc.clusters {
 				r, err := getResponseFromRestrictedEndpoint(handler, "POST", "/parseKubeConfig", clusterReq)
@@ -128,7 +128,7 @@ func TestParseKubeConfigInvalidJSONReturnsBadRequest(t *testing.T) {
 			Cache: cache,
 		},
 	}
-	handler := createHeadlampHandler(context.Background(), &c)
+	handler := createHeadlampHandler(newTestHandlerCtx(t), &c)
 
 	token := uuid.New().String()
 	require.NoError(t, os.Setenv("HEADLAMP_BACKEND_TOKEN", token))
@@ -222,7 +222,7 @@ func TestParseKubeConfigRequiresKubeconfigs(t *testing.T) {
 					Cache: cache,
 				},
 			}
-			handler := createHeadlampHandler(context.Background(), &c)
+			handler := createHeadlampHandler(newTestHandlerCtx(t), &c)
 
 			resp, err := getResponseFromRestrictedEndpoint(handler, "POST", "/parseKubeConfig", tc.body)
 			require.NoError(t, err)
@@ -253,7 +253,7 @@ func TestParseKubeConfigValidClusterReturnedWhenBatchContainsInvalidEntry(t *tes
 			Cache: cache,
 		},
 	}
-	handler := createHeadlampHandler(context.Background(), &c)
+	handler := createHeadlampHandler(newTestHandlerCtx(t), &c)
 
 	body := map[string]interface{}{
 		"kubeconfigs": []string{validKubeConfig, "not-valid-base64-!!!"},
@@ -272,7 +272,7 @@ func TestParseKubeConfigValidClusterReturnedWhenBatchContainsInvalidEntry(t *tes
 	assert.Greater(t, len(config.Clusters), 0, "expected valid clusters to be returned despite the invalid entry")
 }
 
-//nolint:funlen
+//nolint:funlen // Test covers setup, request dispatch, and response assertions
 func TestStatelessClusterApiRequest(t *testing.T) {
 	kubeConfigByte, err := os.ReadFile("./headlamp_testdata/kubeconfig")
 	require.NoError(t, err)
@@ -306,13 +306,14 @@ func TestStatelessClusterApiRequest(t *testing.T) {
 					TelemetryHandler: &telemetry.RequestHandler{},
 				},
 			}
-			handler := createHeadlampHandler(context.Background(), &c)
+			handler := createHeadlampHandler(newTestHandlerCtx(t), &c)
 			headers := map[string]string{
 				"KUBECONFIG":         kubeConfig,
 				"X-HEADLAMP-USER-ID": tc.userID,
 			}
 			requestPath := fmt.Sprintf("/clusters/%s/version/", tc.name)
-			req, err := http.NewRequest("GET", requestPath, nil) //nolint:noctx
+			//nolint:noctx // Test HTTP request does not require context cancellation
+			req, err := http.NewRequest("GET", requestPath, nil)
 			require.NoError(t, err)
 
 			// Add headers to the request
@@ -419,13 +420,14 @@ func TestStatelessContextKeyWithoutUserID(t *testing.T) {
 	assert.Equal(t, "cluster-a", statelessContextKey("cluster-a", ""))
 }
 
-func TestWebsocketConnContextKey(t *testing.T) {
+func TestWebsocketConnContextKey(t *testing.T) { //nolint:funlen // Table covers comma spacing and header deletion.
 	testCases := []struct {
 		name           string
 		protocols      string
 		clusterName    string
 		expectedKey    string
 		expectedHeader string
+		headerDeleted  bool
 	}{
 		{
 			name:           "With authorization protocol",
@@ -441,6 +443,34 @@ func TestWebsocketConnContextKey(t *testing.T) {
 			expectedKey:    "test-cluster",
 			expectedHeader: "v4.channel.k8s.io",
 		},
+		{
+			name:           "No spaces with identity first",
+			protocols:      "base64url.headlamp.authorization.k8s.io.user123,v4.channel.k8s.io",
+			clusterName:    "test-cluster",
+			expectedKey:    statelessContextKey("test-cluster", "user123"),
+			expectedHeader: "v4.channel.k8s.io",
+		},
+		{
+			name:           "No spaces with channel first",
+			protocols:      "v4.channel.k8s.io,base64url.headlamp.authorization.k8s.io.user123",
+			clusterName:    "test-cluster",
+			expectedKey:    statelessContextKey("test-cluster", "user123"),
+			expectedHeader: "v4.channel.k8s.io",
+		},
+		{
+			name:           "Multiple remaining protocols without spaces",
+			protocols:      "base64url.headlamp.authorization.k8s.io.user123,v4.channel.k8s.io,v3.channel.k8s.io",
+			clusterName:    "test-cluster",
+			expectedKey:    statelessContextKey("test-cluster", "user123"),
+			expectedHeader: "v4.channel.k8s.io, v3.channel.k8s.io",
+		},
+		{
+			name:          "Only identity protocol removes the header",
+			protocols:     "base64url.headlamp.authorization.k8s.io.user123",
+			clusterName:   "test-cluster",
+			expectedKey:   statelessContextKey("test-cluster", "user123"),
+			headerDeleted: true,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -450,7 +480,12 @@ func TestWebsocketConnContextKey(t *testing.T) {
 
 			key := websocketConnContextKey(req, tc.clusterName)
 			assert.Equal(t, tc.expectedKey, key)
-			assert.Equal(t, tc.expectedHeader, req.Header.Get("Sec-Websocket-Protocol"))
+
+			if tc.headerDeleted {
+				assert.Empty(t, req.Header.Values("Sec-Websocket-Protocol"))
+			} else {
+				assert.Equal(t, tc.expectedHeader, req.Header.Get("Sec-Websocket-Protocol"))
+			}
 		})
 	}
 }

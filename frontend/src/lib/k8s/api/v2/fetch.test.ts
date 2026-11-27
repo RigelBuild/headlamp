@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, Mock, vi } from 'vitest';
 import { setBackendToken } from '../../../../helpers/getHeadlampAPIHeaders';
 import { findKubeconfigByClusterName } from '../../../../stateless/findKubeconfigByClusterName';
 import { getUserIdFromLocalStorage } from '../../../../stateless/getUserIdFromLocalStorage';
-import { getClusterAuthType } from '../v1/clusterRequests';
+import { getClusterAuthType } from '../../clusterAuthType';
 import { BASE_HTTP_URL, clusterFetch } from './fetch';
 
 vi.mock('../../../auth', () => ({
@@ -35,7 +35,7 @@ vi.mock('../../../../stateless/getUserIdFromLocalStorage', () => ({
   getUserIdFromLocalStorage: vi.fn(),
 }));
 
-vi.mock('../v1/clusterRequests', () => ({
+vi.mock('../../clusterAuthType', () => ({
   getClusterAuthType: vi.fn(),
 }));
 
@@ -114,5 +114,33 @@ describe('clusterFetch', () => {
     nock(BASE_HTTP_URL).get(`/clusters/${clusterName}${testUrl}`).reply(500);
 
     await expect(clusterFetch(testUrl, { cluster: clusterName })).rejects.toThrow('Unreachable');
+  });
+
+  it('extracts plain text error message from non-JSON response', async () => {
+    nock(BASE_HTTP_URL)
+      .get(`/clusters/${clusterName}${testUrl}`)
+      .reply(400, 'Invalid cluster name\n');
+
+    await expect(clusterFetch(testUrl, { cluster: clusterName })).rejects.toThrow(
+      'Invalid cluster name'
+    );
+  });
+
+  it('extracts error field from JSON error response when message is absent', async () => {
+    nock(BASE_HTTP_URL)
+      .get(`/clusters/${clusterName}${testUrl}`)
+      .reply(400, { error: 'invalid_grant' });
+
+    await expect(clusterFetch(testUrl, { cluster: clusterName })).rejects.toThrow('invalid_grant');
+  });
+
+  it('extracts error_description from OAuth-style error response', async () => {
+    nock(BASE_HTTP_URL)
+      .get(`/clusters/${clusterName}${testUrl}`)
+      .reply(400, { error: 'invalid_request', error_description: 'Code parameter is missing' });
+
+    await expect(clusterFetch(testUrl, { cluster: clusterName })).rejects.toThrow(
+      'Code parameter is missing'
+    );
   });
 });

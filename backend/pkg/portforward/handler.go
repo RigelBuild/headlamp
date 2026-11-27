@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,30 +34,37 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
-	"github.com/kubernetes-sigs/headlamp/backend/pkg/auth"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/logger"
 	authv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/httpstream" //nolint:staticcheck // SA1019: client-go/tools/portforward still uses this; migrate when upstream does.
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
 	streamhttp "k8s.io/streaming/pkg/httpstream"
 )
 
 const (
-	RUNNING = "Running"
-	STOPPED = "Stopped"
+	RUNNING      = "Running"
+	STOPPED      = "Stopped"
+	RECONNECTING = "Reconnecting"
 )
 
 const (
 	PodAvailabilityCheckTimer   = 5 // seconds
 	PortForwardReadinessTimeout = 30 * time.Second
+	maxPortForwardBodyBytes     = 64 << 10
+	maxPortForwardIDLength      = 128
 )
+
+var portForwardBodyReadTimeout = 5 * time.Second
 
 var inFlightPortForwards sync.Map
 
@@ -70,17 +78,116 @@ type portForwardRequest struct {
 	Port             string `json:"port"`
 }
 
+func validatePortForwardID(id string) error {
+	if id == "" || len(id) > maxPortForwardIDLength {
+		return fmt.Errorf(
+			"invalid portforward id: must be 1-%d characters matching [A-Za-z0-9._-]",
+			maxPortForwardIDLength,
+		)
+	}
+
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		isLower := c >= 'a' && c <= 'z'
+		isUpper := c >= 'A' && c <= 'Z'
+		isDigit := c >= '0' && c <= '9'
+		isPunct := c == '.' || c == '_' || c == '-'
+
+		if !isLower && !isUpper && !isDigit && !isPunct {
+			return fmt.Errorf(
+				"invalid portforward id: must be 1-%d characters matching [A-Za-z0-9._-]",
+				maxPortForwardIDLength,
+			)
+		}
+	}
+
+	return nil
+}
+
+func validatePortNumber(field, raw string) error {
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < 1 || port > 65535 || strconv.Itoa(port) != raw {
+		return fmt.Errorf("%s must be a valid port number between 1 and 65535", field)
+	}
+
+	return nil
+}
+
+func decodePortForwardJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	rc := http.NewResponseController(w)
+	if err := rc.SetReadDeadline(time.Now().Add(portForwardBodyReadTimeout)); err == nil {
+		defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxPortForwardBodyBytes)
+	dec := json.NewDecoder(r.Body)
+
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return err
+		}
+
+		return errors.New("request body must contain a single JSON object")
+	}
+
+	return nil
+}
+
 func (p *portForwardRequest) Validate() error {
 	if p.Namespace == "" {
 		return fmt.Errorf("namespace is required")
+	}
+
+	if errs := validation.IsDNS1123Label(p.Namespace); len(errs) > 0 {
+		return fmt.Errorf("invalid namespace: %s", strings.Join(errs, "; "))
 	}
 
 	if p.Pod == "" {
 		return fmt.Errorf("pod name is required")
 	}
 
+	if errs := validation.IsDNS1123Subdomain(p.Pod); len(errs) > 0 {
+		return fmt.Errorf("invalid pod name: %s", strings.Join(errs, "; "))
+	}
+
 	if p.TargetPort == "" {
 		return fmt.Errorf("targetPort is required")
+	}
+
+	if err := validatePortNumber("targetPort", p.TargetPort); err != nil {
+		return err
+	}
+
+	if p.Port != "" {
+		if err := validatePortNumber("port", p.Port); err != nil {
+			return err
+		}
+	}
+
+	if p.Service != "" {
+		if errs := validation.IsDNS1123Label(p.Service); len(errs) > 0 {
+			return fmt.Errorf("invalid service name: %s", strings.Join(errs, "; "))
+		}
+
+		if p.ServiceNamespace == "" {
+			return fmt.Errorf("serviceNamespace is required when service is set")
+		}
+	}
+
+	if p.ServiceNamespace != "" {
+		if errs := validation.IsDNS1123Label(p.ServiceNamespace); len(errs) > 0 {
+			return fmt.Errorf("invalid serviceNamespace: %s", strings.Join(errs, "; "))
+		}
+	}
+
+	if p.ID != "" {
+		if err := validatePortForwardID(p.ID); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -90,16 +197,17 @@ type portForward struct {
 	mu               *sync.Mutex
 	ID               string `json:"id"`
 	closeChan        chan struct{}
-	Pod              string `json:"pod"`
-	Service          string `json:"service"`
-	ServiceNamespace string `json:"serviceNamespace"`
-	Namespace        string `json:"namespace"`
-	Cluster          string `json:"cluster"`
-	cacheKey         string `json:"-"`
-	Port             string `json:"port"`
-	TargetPort       string `json:"targetPort"`
-	Status           string `json:"status"`
-	Error            string `json:"error"`
+	Pod              string       `json:"pod"`
+	Service          string       `json:"service"`
+	ServiceNamespace string       `json:"serviceNamespace"`
+	Namespace        string       `json:"namespace"`
+	Cluster          string       `json:"cluster"`
+	cacheKey         string       `json:"-"`
+	Port             string       `json:"port"`
+	TargetPort       string       `json:"targetPort"`
+	Status           string       `json:"status"`
+	Error            string       `json:"error"`
+	rConf            *rest.Config `json:"-"` // needed for reconnect on pod restart
 }
 
 // setStatusAndSnapshot updates the Status and Error fields and returns a
@@ -136,16 +244,24 @@ func getFreePort() (int, error) {
 }
 
 // StartPortForward handles the port forward request.
-//
-//nolint:funlen
 func StartPortForward(kubeConfigStore kubeconfig.ContextStore, cache cache.Cache[interface{}],
 	unsafeUseServiceAccountToken bool,
 	contextKey string,
 	w http.ResponseWriter, r *http.Request,
 ) {
+	r = r.Clone(r.Context())
+	r.Method = http.MethodPost
+	RequestHandler(kubeConfigStore, cache, unsafeUseServiceAccountToken, false, contextKey, w, r)
+}
+
+//nolint:funlen // Validates and starts a forward using the authenticated owner's cache scope.
+func startPortForwardForOwner(kContext *kubeconfig.Context, cache cache.Cache[interface{}],
+	unsafeUseServiceAccountToken bool, contextKey, cacheKey string,
+	w http.ResponseWriter, r *http.Request,
+) {
 	var p portForwardRequest
 
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	if err := decodePortForwardJSON(w, r, &p); err != nil {
 		logger.Log(logger.LevelError, nil, err, "decoding portforward payload")
 		http.Error(w, "failed to marshal port forward payload "+err.Error(), http.StatusBadRequest)
 
@@ -156,22 +272,30 @@ func StartPortForward(kubeConfigStore kubeconfig.ContextStore, cache cache.Cache
 		p.ID = uuid.New().String()
 	}
 
+	if err := p.Validate(); err != nil {
+		logger.Log(logger.LevelError, nil, err, "validating portforward payload")
+		http.Error(w, err.Error(), http.StatusBadRequest)
+
+		return
+	}
+
 	requestClusterName := mux.Vars(r)["clusterName"]
 
 	// Ensure we don't orphan an existing port-forward by overwriting its cache entry.
 	// This check happens before any resource allocation or blocking code so duplicates short-circuit
 	// deterministically and avoid unnecessary listener churn.
-	if existingPF, err := getPortForwardByID(cache, contextKey, p.ID); err == nil && existingPF.Status == RUNNING {
-		//nolint:goconst
+	if existingPF, err := getPortForwardByID(cache, cacheKey, p.ID); err == nil &&
+		(existingPF.Status == RUNNING || existingPF.Status == RECONNECTING) {
+		//nolint:goconst // Repeated log message keys are clearer inline than as package constants
 		logger.Log(logger.LevelError, map[string]string{"cluster": contextKey, "id": p.ID},
 			nil, "portforward ID already exists")
-		http.Error(w, "portforward with this ID is already running", http.StatusConflict)
+		http.Error(w, "portforward with this ID is already active", http.StatusConflict)
 
 		return
 	}
 
 	// Reject duplicates before any resource-consuming work (port alloc, kubeconfig lookup).
-	inFlightKey := strings.Join([]string{contextKey, p.ID}, "\x00")
+	inFlightKey := strings.Join([]string{cacheKey, p.ID}, "\x00")
 	if _, loaded := inFlightPortForwards.LoadOrStore(inFlightKey, struct{}{}); loaded {
 		logger.Log(logger.LevelError, map[string]string{"cluster": contextKey, "id": p.ID},
 			nil, "portforward ID is already starting")
@@ -181,13 +305,6 @@ func StartPortForward(kubeConfigStore kubeconfig.ContextStore, cache cache.Cache
 	}
 
 	defer inFlightPortForwards.Delete(inFlightKey)
-
-	if err := p.Validate(); err != nil {
-		logger.Log(logger.LevelError, nil, err, "validating portforward payload")
-		http.Error(w, err.Error(), http.StatusBadRequest)
-
-		return
-	}
 
 	if p.Port == "" {
 		freePort, err := getFreePort()
@@ -201,22 +318,26 @@ func StartPortForward(kubeConfigStore kubeconfig.ContextStore, cache cache.Cache
 		p.Port = strconv.Itoa(freePort)
 	}
 
-	kContext, err := kubeConfigStore.GetContext(contextKey)
-	if err != nil {
-		logger.Log(logger.LevelError, map[string]string{"cluster": contextKey},
-			err, "getting kubeconfig context")
-
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-
-		return
-	}
-
 	token := ""
+
 	if !unsafeUseServiceAccountToken || !kContext.UsesInClusterServiceAccountToken() {
-		token, _ = auth.GetTokenFromCookie(r, requestClusterName)
+		var err error
+
+		token, err = requestToken(r)
+		if err != nil {
+			logger.Log(logger.LevelWarn, nil, err, "reading portforward credentials")
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+
+			return
+		}
 	}
 
-	err = startPortForward(kContext, cache, p, token, contextKey, requestClusterName)
+	if token != "" {
+		kContext = kContext.Copy()
+		kContext.AuthInfo = &api.AuthInfo{Token: token}
+	}
+
+	err := startPortForward(kContext, cache, p, token, cacheKey, requestClusterName)
 	if err != nil {
 		logger.Log(logger.LevelError, nil, err, "starting portforward")
 
@@ -363,18 +484,18 @@ func buildPortForwardURL(host, namespace, podName, targetPort string) (*url.URL,
 
 // initPortForwarder sets up the SPDY dialer and creates a new port forwarder.
 // It requires a REST config, namespace, pod name, and the port mapping string (e.g., "8080:80").
-// It returns the port forwarder instance, stop/ready channels, output/error buffers, or an error.
+// It returns the port forwarder instance, stop/ready channels, an error buffer, or an error.
 func initPortForwarder(rConf *rest.Config, namespace, podName, portMapping, targetPort string) (
-	*portforward.PortForwarder, chan struct{}, chan struct{}, *bytes.Buffer, *bytes.Buffer, error,
+	*portforward.PortForwarder, chan struct{}, chan struct{}, *bytes.Buffer, error,
 ) {
 	roundTripper, upgrader, err := spdy.RoundTripperFor(rConf)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("failed to create SPDY round tripper: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create SPDY round tripper: %w", err)
 	}
 
 	fullURL, err := buildPortForwardURL(rConf.Host, namespace, podName, targetPort)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	// Path-routed proxies use WebSocket first; direct API endpoints use SPDY.
@@ -385,10 +506,10 @@ func initPortForwarder(rConf *rest.Config, namespace, podName, portMapping, targ
 
 	forwarder, err := portforward.New(dialer, []string{portMapping}, stopChan, readyChan, out, errOut)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("failed to create portforwarder: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to create portforwarder: %w", err)
 	}
 
-	return forwarder, stopChan, readyChan, out, errOut, nil
+	return forwarder, stopChan, readyChan, errOut, nil
 }
 
 // safeCloseChan attempts to close a channel and recovers from a panic
@@ -409,6 +530,7 @@ func safeCloseChan(ch chan struct{}) {
 // target pod for a port-forward is still running. If the pod is not running
 // (or if an unrecoverable error occurs during check), it signals the port-forward
 // to stop by closing its stopChan and updates its status in the cache.
+// For service-backed port-forwards, it attempts automatic reconnection to a new pod.
 // It stops when the associated port-forward's closeChan is closed.
 func monitorPodAndManagePortForward(
 	clientset *kubernetes.Clientset,
@@ -423,28 +545,225 @@ func monitorPodAndManagePortForward(
 	for {
 		select {
 		case <-ticker.C:
-			err := checkIfPodIsRunning(clientset, pfDetails.Namespace, pfDetails.Pod)
-			if err != nil {
-				if errors.Is(err, syscall.ECONNREFUSED) {
-					logger.Log(logger.LevelInfo, logParams, err, "checking pod (ECONNREFUSED), continuing")
-					continue
-				}
-
-				errMsg := fmt.Sprintf("Pod %s/%s check failed: %v", pfDetails.Namespace, pfDetails.Pod, err)
-				logger.Log(logger.LevelError, logParams, errors.New(errMsg), "stopping port-forward due to pod status")
-
-				pfSnapshot := pfDetails.setStatusAndSnapshot(STOPPED, errMsg)
-				portforwardstore(cache, pfSnapshot)
-				safeCloseChan(pfDetails.closeChan)
-
+			if handlePodCheck(clientset, cache, pfDetails, logParams) {
 				return
 			}
 		case <-pfDetails.closeChan:
-			logger.Log(logger.LevelInfo, logParams, nil, "Pod monitor stopping: port forward closeChan was closed.")
+			// closeChan only fires for user-initiated stop/delete
+			// (forwardPortsAsync does NOT close it).
+			logger.Log(logger.LevelInfo, logParams, nil,
+				"Pod monitor stopping: port forward closeChan was closed.")
 
 			return
 		}
 	}
+}
+
+// handlePodCheck checks if the monitored pod is still alive and either
+// triggers reconnection (service-backed) or marks the PF stopped (direct).
+// Returns true when the caller (monitor loop) should exit.
+func handlePodCheck(
+	clientset *kubernetes.Clientset,
+	cache cache.Cache[interface{}],
+	pfDetails *portForward,
+	logParams map[string]string,
+) bool {
+	err := checkIfPodIsRunning(clientset, pfDetails.Namespace, pfDetails.Pod)
+	if err == nil {
+		return false // pod is fine
+	}
+
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		logger.Log(logger.LevelInfo, logParams, err, "checking pod (ECONNREFUSED), continuing")
+		return false
+	}
+
+	// If this port-forward is backed by a Service, attempt auto-reconnect
+	// to a replacement pod instead of immediately stopping.
+	if pfDetails.Service != "" {
+		logger.Log(logger.LevelInfo, logParams, err,
+			"pod unavailable, attempting reconnect via service")
+
+		pfSnapshot := pfDetails.setStatusAndSnapshot(RECONNECTING, "")
+		portforwardstore(cache, pfSnapshot)
+
+		// Close the old forwarder's stop channel so its goroutine
+		// exits, then allocate a fresh one. attemptReconnect's
+		// backoff select listens on closeChan for user-initiated
+		// cancellation; without a new channel, the select would
+		// fire immediately on the already-closed channel.
+		safeCloseChan(pfDetails.closeChan)
+
+		pfDetails.mu.Lock()
+		pfDetails.closeChan = make(chan struct{})
+		pfDetails.mu.Unlock()
+
+		if attemptReconnect(clientset, cache, pfDetails) {
+			return true // new monitor goroutine started by runAndMonitorPortForward
+		}
+		// All reconnect attempts failed — fall through to stop
+	}
+
+	errMsg := fmt.Sprintf("Pod %s/%s check failed: %v", pfDetails.Namespace, pfDetails.Pod, err)
+	logger.Log(logger.LevelError, logParams, errors.New(errMsg), "stopping port-forward due to pod status")
+
+	pfSnapshot := pfDetails.setStatusAndSnapshot(STOPPED, errMsg)
+	portforwardstore(cache, pfSnapshot)
+	safeCloseChan(pfDetails.closeChan)
+
+	return true
+}
+
+// resolveServicePod queries the EndpointSlice API for the given service and
+// returns the name and namespace of the first ready pod backing the service.
+func resolveServicePod(
+	clientset kubernetes.Interface, serviceNamespace, serviceName string,
+) (podName string, podNamespace string, err error) {
+	slices, err := clientset.DiscoveryV1().EndpointSlices(serviceNamespace).List(
+		context.Background(), v1.ListOptions{
+			LabelSelector: discoveryv1.LabelServiceName + "=" + serviceName,
+		})
+	if err != nil {
+		return "", "", fmt.Errorf("failed to list endpointslices for service %s/%s: %w",
+			serviceNamespace, serviceName, err)
+	}
+
+	for i := range slices.Items {
+		for j := range slices.Items[i].Endpoints {
+			ep := &slices.Items[i].Endpoints[j]
+			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+				continue
+			}
+
+			if ep.TargetRef != nil && ep.TargetRef.Kind == "Pod" {
+				ns := serviceNamespace
+				if ep.TargetRef.Namespace != "" {
+					ns = ep.TargetRef.Namespace
+				}
+
+				return ep.TargetRef.Name, ns, nil
+			}
+		}
+	}
+
+	return "", "", fmt.Errorf("no ready endpoints for service %s/%s",
+		serviceNamespace, serviceName)
+}
+
+// attemptReconnect tries to re-establish a port-forward by finding a new pod
+// behind the same service. It retries up to 3 times with exponential backoff
+// (5s, 10s, 20s). Returns true if reconnection succeeded.
+func attemptReconnect(
+	clientset *kubernetes.Clientset,
+	cache cache.Cache[interface{}],
+	pfDetails *portForward,
+) bool {
+	logParams := map[string]string{
+		"id": pfDetails.ID, "service": pfDetails.Service,
+		"serviceNamespace": pfDetails.ServiceNamespace,
+	}
+	backoffs := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second}
+
+	for attempt, delay := range backoffs {
+		logger.Log(logger.LevelInfo, logParams, nil,
+			fmt.Sprintf("reconnect attempt %d/%d, waiting %s", attempt+1, len(backoffs), delay))
+
+		// Use a select so the backoff sleep is cancellable when the user
+		// stops or deletes the port-forward during a retry window.
+		select {
+		case <-time.After(delay):
+		case <-pfDetails.closeChan:
+			logger.Log(logger.LevelInfo, logParams, nil, "reconnect cancelled during backoff")
+			return false
+		}
+
+		ok, abort := tryReconnectOnce(clientset, cache, pfDetails, logParams)
+		if abort {
+			return false
+		}
+
+		if ok {
+			return true
+		}
+
+		// Not ok and not abort → retry on next iteration.
+	}
+
+	logger.Log(logger.LevelError, logParams, nil, "all reconnect attempts exhausted")
+
+	return false
+}
+
+// storeReconnecting persists the RECONNECTING status to the cache.
+func storeReconnecting(cache cache.Cache[interface{}], pfDetails *portForward) {
+	portforwardstore(cache, pfDetails.setStatusAndSnapshot(RECONNECTING, ""))
+}
+
+// tryReconnectOnce resolves a new pod for the service, initialises a fresh
+// port-forwarder, swaps closeChan safely, and starts monitoring.
+// It returns (true, false) on success, (false, true) to abort retries,
+// or (false, false) when the caller should retry.
+//
+//nolint:cyclop // Reconnection state machine handles complex recovery branches
+func tryReconnectOnce(
+	clientset *kubernetes.Clientset,
+	cache cache.Cache[interface{}],
+	pfDetails *portForward,
+	logParams map[string]string,
+) (ok bool, abort bool) {
+	newPod, podNamespace, err := resolveServicePod(
+		clientset, pfDetails.ServiceNamespace, pfDetails.Service)
+	if err != nil {
+		logger.Log(logger.LevelError, logParams, err, "resolving service endpoint for reconnect")
+		storeReconnecting(cache, pfDetails)
+
+		return false, false
+	}
+
+	if pfDetails.rConf == nil {
+		logger.Log(logger.LevelError, logParams, nil, "no REST config available for reconnect")
+		return false, true
+	}
+
+	portMapping := pfDetails.Port + ":" + pfDetails.TargetPort
+
+	forwarder, stopChan, readyChan, errOut, err := initPortForwarder(
+		pfDetails.rConf, podNamespace, newPod, portMapping, pfDetails.TargetPort,
+	)
+	if err != nil {
+		logger.Log(logger.LevelError, logParams, err, "re-initializing port forwarder")
+		storeReconnecting(cache, pfDetails)
+
+		return false, false
+	}
+
+	// Swap closeChan to the new forwarder's stopChan and update pod info.
+	pfDetails.mu.Lock()
+	oldCloseChan := pfDetails.closeChan
+	pfDetails.closeChan = stopChan
+	pfDetails.Pod = newPod
+	pfDetails.Namespace = podNamespace
+	pfDetails.mu.Unlock()
+
+	safeCloseChan(oldCloseChan)
+
+	err = runAndMonitorPortForward(clientset, cache, pfDetails, forwarder, readyChan, errOut)
+	if err != nil {
+		logger.Log(logger.LevelError, logParams, err, "reconnected forwarder failed readiness")
+		// handlePortForwardError closed closeChan; allocate a fresh one
+		// so the next backoff select doesn't abort remaining retries.
+		pfDetails.mu.Lock()
+		pfDetails.closeChan = make(chan struct{})
+		pfDetails.mu.Unlock()
+		storeReconnecting(cache, pfDetails)
+
+		return false, false
+	}
+
+	logger.Log(logger.LevelInfo, logParams, nil,
+		fmt.Sprintf("successfully reconnected to pod %s/%s", podNamespace, newPod))
+
+	return true, false
 }
 
 func handlePortForwardError(
@@ -535,27 +854,24 @@ func handlePortForwardReadiness(
 	return nil
 }
 
-// forwardPortsAsync runs ForwardPorts in a goroutine, reporting errors via forwardErrChan
-// and updating the portForward status in the cache on completion.
+// forwardPortsAsync runs ForwardPorts in a goroutine, reporting errors via
+// forwardErrChan. It does NOT close closeChan or set port-forward status
+// on exit — the monitor goroutine owns all lifecycle decisions (reconnect
+// vs stop) and detects pod death independently via its polling ticker.
 func forwardPortsAsync(
-	cache cache.Cache[interface{}],
-	pfDetails *portForward,
 	forwarder *portforward.PortForwarder,
 	forwardErrChan chan error,
 	logParams map[string]string,
 ) {
 	go func() {
-		defer func() {
-			safeCloseChan(pfDetails.closeChan)
-			close(forwardErrChan)
-		}()
+		defer close(forwardErrChan)
 
 		if err := forwarder.ForwardPorts(); err != nil {
 			logger.Log(logger.LevelError, logParams, err, "ForwardPorts() failed")
 
-			pfSnapshot := pfDetails.setStatusAndSnapshot(STOPPED, err.Error())
-			portforwardstore(cache, pfSnapshot)
-
+			// Report the error to the readiness handler if it's still
+			// listening. Do NOT set status or close closeChan here —
+			// the monitor goroutine decides whether to reconnect or stop.
 			select {
 			case forwardErrChan <- err:
 			default:
@@ -564,32 +880,7 @@ func forwardPortsAsync(
 			return
 		}
 
-		logger.Log(logger.LevelInfo, logParams, nil, "ForwardPorts() exited.")
-
-		if pfDetails.mu != nil {
-			pfDetails.mu.Lock()
-		}
-
-		shouldStore := pfDetails.Status == RUNNING
-		if shouldStore {
-			pfDetails.Status = STOPPED
-			if pfDetails.Error == "" {
-				pfDetails.Error = "Port forward stopped."
-			}
-		}
-
-		var pfSnapshot portForward
-		if shouldStore {
-			pfSnapshot = *pfDetails
-		}
-
-		if pfDetails.mu != nil {
-			pfDetails.mu.Unlock()
-		}
-
-		if shouldStore {
-			portforwardstore(cache, pfSnapshot)
-		}
+		logger.Log(logger.LevelInfo, logParams, nil, "ForwardPorts() exited cleanly.")
 	}()
 }
 
@@ -609,7 +900,7 @@ func runAndMonitorPortForward(
 	}
 	forwardErrChan := make(chan error, 1)
 
-	forwardPortsAsync(cache, pfDetails, forwarder, forwardErrChan, logParams)
+	forwardPortsAsync(forwarder, forwardErrChan, logParams)
 
 	err := handlePortForwardReadiness(cache, pfDetails, readyChan, errOut, logParams, forwardErrChan)
 	if err != nil {
@@ -642,18 +933,16 @@ func startPortForward(kContext *kubeconfig.Context, cache cache.Cache[interface{
 	var (
 		forwarder           *portforward.PortForwarder
 		stopChan, readyChan chan struct{}
-		outBuffer, errOut   *bytes.Buffer
+		errOut              *bytes.Buffer
 		errInit             error
 	)
 
-	forwarder, stopChan, readyChan, outBuffer, errOut, errInit = initPortForwarder(
+	forwarder, stopChan, readyChan, errOut, errInit = initPortForwarder(
 		rConf, p.Namespace, p.Pod, portMapping, p.TargetPort,
 	)
 	if errInit != nil {
 		return fmt.Errorf("failed to initialize port forwarder: %w", errInit)
 	}
-
-	_ = outBuffer // Avoid unused variable error if outBuffer isn't used directly later
 
 	pfDetails := &portForward{
 		mu:               &sync.Mutex{},
@@ -669,6 +958,7 @@ func startPortForward(kContext *kubeconfig.Context, cache cache.Cache[interface{
 		Status:           RUNNING,
 		Port:             p.Port,
 		Error:            "",
+		rConf:            rConf,
 	}
 
 	return runAndMonitorPortForward(clientset, cache, pfDetails, forwarder, readyChan, errOut)
@@ -680,6 +970,12 @@ func checkIfPodIsRunning(clientset *kubernetes.Clientset, namespace string, pod 
 	p, err := clientset.CoreV1().Pods(namespace).Get(ctx, pod, v1.GetOptions{})
 	if err != nil {
 		return err
+	}
+
+	// A pod that has been deleted but is still in its termination grace period
+	// reports Phase: Running. Check DeletionTimestamp to catch this case.
+	if p.DeletionTimestamp != nil {
+		return errors.New("pod is terminating")
 	}
 
 	if p.Status.Phase != corev1.PodRunning {
@@ -700,16 +996,16 @@ func (r *stopOrDeletePortForwardRequest) Validate() error {
 		return errors.New("invalid request, id is required")
 	}
 
-	return nil
+	return validatePortForwardID(r.ID)
 }
 
 // StopOrDeletePortForward handles stop or delete port forward request.
-func StopOrDeletePortForward(cache cache.Cache[interface{}], contextKey string,
+func StopOrDeletePortForward(sessions cache.Cache[interface{}], contextKey string,
 	w http.ResponseWriter, r *http.Request,
 ) {
 	var p stopOrDeletePortForwardRequest
 
-	err := json.NewDecoder(r.Body).Decode(&p)
+	err := decodePortForwardJSON(w, r, &p)
 	if err != nil {
 		logger.Log(logger.LevelError, nil, err, "decoding delete portforward payload")
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -724,7 +1020,7 @@ func StopOrDeletePortForward(cache cache.Cache[interface{}], contextKey string,
 		return
 	}
 
-	err = stopOrDeletePortForward(cache, contextKey, p.ID, p.StopOrDelete)
+	err = stopOrDeletePortForward(sessions, contextKey, p.ID, p.StopOrDelete)
 	if err == nil {
 		if _, err := w.Write([]byte("stopped")); err != nil {
 			logger.Log(logger.LevelError, nil, err, "writing response")
@@ -734,7 +1030,12 @@ func StopOrDeletePortForward(cache cache.Cache[interface{}], contextKey string,
 		return
 	}
 
-	http.Error(w, "failed to delete port forward "+err.Error(), http.StatusInternalServerError)
+	status := http.StatusInternalServerError
+	if errors.Is(err, cache.ErrNotFound) {
+		status = http.StatusNotFound
+	}
+
+	http.Error(w, "failed to delete port forward "+err.Error(), status)
 }
 
 // GetPortForwards handles get port forwards request.
@@ -790,19 +1091,29 @@ func GetPortForwardByID(cache cache.Cache[interface{}], contextKey string,
 	}
 
 	type payload struct {
-		ID        string `json:"id"`
-		Pod       string `json:"pod"`
-		Service   string `json:"service"`
-		Cluster   string `json:"cluster"`
-		Namespace string `json:"namespace"`
+		ID               string `json:"id"`
+		Pod              string `json:"pod"`
+		Service          string `json:"service"`
+		ServiceNamespace string `json:"serviceNamespace"`
+		Cluster          string `json:"cluster"`
+		Namespace        string `json:"namespace"`
+		Port             string `json:"port"`
+		TargetPort       string `json:"targetPort"`
+		Status           string `json:"status"`
+		Error            string `json:"error"`
 	}
 
 	portForwardStruct := payload{
-		ID:        p.ID,
-		Pod:       p.Pod,
-		Namespace: p.Namespace,
-		Cluster:   cluster,
-		Service:   p.Service,
+		ID:               p.ID,
+		Pod:              p.Pod,
+		Namespace:        p.Namespace,
+		Cluster:          cluster,
+		Service:          p.Service,
+		ServiceNamespace: p.ServiceNamespace,
+		Port:             p.Port,
+		TargetPort:       p.TargetPort,
+		Status:           p.Status,
+		Error:            p.Error,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

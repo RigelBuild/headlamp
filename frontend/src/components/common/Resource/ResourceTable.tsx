@@ -84,6 +84,10 @@ export type ResourceTableColumn<RowItem> = {
    * @default true
    **/
   sort?: boolean | ((a: RowItem, b: RowItem) => number);
+  /**
+   * Sort descending on the first click. By default only columns whose values are numbers do.
+   */
+  sortDescFirst?: boolean;
   /** Change how filtering behaves, by default it will just search the text value */
   filterVariant?: TableColumn<any>['filterVariant'];
   disableFiltering?: boolean;
@@ -140,6 +144,9 @@ const DEFAULT_SORT_COLUMN_ID = 'age';
  */
 const MAX_TABLE_ID_LENGTH = 50;
 
+/** What a table asked to list from no cluster shows, kept stable across renders. */
+const NOTHING_LISTED = { items: [], errors: null };
+
 export interface ResourceTableProps<RowItem> {
   /** The columns to be rendered, like used in Table, or by name. */
   columns: (ResourceTableColumn<RowItem> | ColumnType)[];
@@ -167,18 +174,43 @@ export interface ResourceTableProps<RowItem> {
   data: Array<RowItem> | null;
   /** Filter out rows from the table */
   filterFunction?: (item: RowItem) => boolean;
+  /**
+   * Structured search: return a boolean to decide the row outright (skipping fuzzy matching),
+   * or undefined to fall back to the default search.
+   */
+  searchFilter?: (item: RowItem, search: string) => boolean | undefined;
+  /**
+   * When true, the table's default row filtering ignores the global namespace
+   * filter, so a stale/unrelated namespace selection elsewhere in the app can't
+   * hide this table's rows. Textual/search filtering is unaffected. Has no effect
+   * on cluster-scoped rows (items without metadata.namespace), and is ignored if
+   * a custom filterFunction is provided.
+   */
+  noNamespaceFilter?: boolean;
   /** Display an error message. Table will be hidden even if data is present */
   errorMessage?: string | null;
   /** Display an errors */
   errors?: ApiError[] | null;
   /** State of the Table (page, rows per page) is reflected in the url */
   reflectInURL?: string | boolean;
+  /**
+   * Optional quick-action controls (e.g. "Refresh", "Create <Kind>") shown
+   * below the empty message when the table has no data. Pass `null` to
+   * explicitly suppress the default that `ResourceListView` provides.
+   */
+  emptyActions?: ReactNode;
 }
 
 export interface ResourceTableFromResourceClassProps<KubeClass extends KubeObjectClass>
   extends Omit<ResourceTableProps<InstanceType<KubeClass>>, 'data'> {
   resourceClass: KubeClass;
   namespaces?: string[];
+  /**
+   * The clusters to list from. Defaults to every selected cluster; a resource
+   * served by only some of them passes the subset that serves it, so the others
+   * are not queried. An empty list queries no cluster and shows an empty table.
+   */
+  clusters?: string[];
 }
 
 export default function ResourceTable<KubeClass extends KubeObjectClass>(
@@ -198,11 +230,13 @@ export default function ResourceTable<KubeClass extends KubeObjectClass>(
 function TableFromResourceClass<KubeClass extends KubeObjectClass>(
   props: ResourceTableFromResourceClassProps<KubeClass>
 ) {
-  const { resourceClass, id, ...otherProps } = props;
+  const { resourceClass, id, clusters, ...otherProps } = props;
   const selectedNamespaces = useNamespaces();
-  const { items, errors } = resourceClass.useList({
+  const listed = resourceClass.useList({
     namespace: props.namespaces ?? selectedNamespaces,
+    clusters,
   });
+  const { items, errors } = clusters?.length === 0 ? NOTHING_LISTED : listed;
 
   // throttle the update of the table to once per second
   const throttledItems = useThrottle(items, 1000);
@@ -247,8 +281,8 @@ function initColumnVisibilityState(columns: ResourceTableProps<any>['columns'], 
     }
     if (typeof col === 'string') return;
 
-    if ('show' in col) {
-      visibility[col.id ?? String(index)] = col.show ?? true;
+    if (col.show === false) {
+      visibility[col.id ?? String(index)] = false;
     }
   });
 
@@ -322,6 +356,8 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
     noProcessing = false,
     hideColumns = [],
     filterFunction,
+    searchFilter,
+    noNamespaceFilter,
     errorMessage,
     reflectInURL,
     data,
@@ -330,13 +366,14 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
     enableRowActions = false,
     enableRowSelection = false,
     errors,
+    emptyActions,
   } = props;
   const { t } = useTranslation(['glossary', 'translation']);
   const theme = useTheme();
   const storeRowsPerPageOptions = useSettings('tableRowsPerPageOptions');
   const clusters = useSelectedClusters();
   const tableProcessors = useTypedSelector(state => state.resourceTable.tableColumnsProcessors);
-  const defaultFilterFunc = useFilterFunc();
+  const defaultFilterFunc = useFilterFunc(undefined, noNamespaceFilter);
   const [columnVisibility, setColumnVisibility] = useState(() =>
     initColumnVisibilityState(columns, id)
   );
@@ -430,6 +467,7 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
             filterVariant: column.filterVariant,
             enableMultiSort: !!sort,
             enableSorting: !!sort,
+            sortDescFirst: column.sortDescFirst,
             enableColumnFilter: !column.disableFiltering,
             muiTableBodyCellProps: {
               ...column.cellProps,
@@ -636,7 +674,7 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
                 <ListItemIcon>
                   <Icon icon={meta.icon} width="20" />
                 </ListItemIcon>
-                <ListItemText>{t(meta.labelKey)}</ListItemText>
+                <ListItemText>{t(meta.labelKey, { ns: ['glossary', 'translation'] })}</ListItemText>
               </MenuItem>
             ))}
           </React.Fragment>
@@ -721,8 +759,9 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
   const filterFunc = filterFunction ?? defaultFilterFunc;
 
   // Faceted values build a unique-value map per column across the full dataset.
-  // On large clusters this is the dominant cause of OOM crashes, so we disable
-  // it once the dataset exceeds a threshold where the cost outweighs the UX benefit.
+  // On large clusters this is the dominant cause of OOM crashes, so we disable it once the
+  // dataset exceeds a threshold. Table then fills the select filters from a bounded walk of
+  // the dropdown columns alone, which keeps those filters usable without the full map.
   const enableFacetedValues = (data?.length ?? 0) <= 500;
 
   return (
@@ -750,6 +789,10 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
         renderRowActionMenuItems={renderRowActionMenuItems}
         filterFns={{
           kubeObjectSearch: (row, id, filterValue) => {
+            const searchFilterResult = searchFilter?.(row.original, filterValue);
+            if (searchFilterResult !== undefined) {
+              return searchFilterResult;
+            }
             const customFilterResult = filterFunc(row.original, filterValue);
             const fuzzyColumnsResult = MRT_FilterFns.contains(row, id, filterValue);
             return customFilterResult || fuzzyColumnsResult;
@@ -758,6 +801,7 @@ function ResourceTableContent<RowItem extends KubeObject>(props: ResourceTablePr
         globalFilterFn="kubeObjectSearch"
         filterFunction={filterFunc}
         getRowId={getResourceRowId}
+        emptyActions={errorMessage || (errors && errors.length) ? undefined : emptyActions}
       />
     </>
   );

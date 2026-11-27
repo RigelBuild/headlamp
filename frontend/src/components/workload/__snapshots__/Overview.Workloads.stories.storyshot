@@ -53,7 +53,7 @@
                           >
                             1 Healthy
                             <span
-                              class="MuiBox-root css-172fsqw"
+                              class="MuiBox-root css-mdv428"
                             >
                               1 Other
                             </span>
@@ -76,7 +76,9 @@
                                 cx="70"
                                 cy="70"
                                 height="112"
+                                role="application"
                                 style="width: 100%; height: 100%;"
+                                tabindex="0"
                                 viewBox="0 0 112 112"
                                 width="112"
                               >
@@ -102,12 +104,15 @@
                                     class="recharts-layer recharts-pie-sector"
                                     tabindex="-1"
                                   >
-                                    <path
-                                      aria-label="50 %"
-                                      class="recharts-sector"
-                                      cx="61"
-                                      cy="61"
-                                      d="M 61,16.199999999999996
+                                    <g
+                                      class="recharts-layer recharts-active-shape"
+                                    >
+                                      <path
+                                        aria-label="healthy: 1 (50%)"
+                                        class="recharts-sector"
+                                        cx="61"
+                                        cy="61"
+                                        d="M 61,16.199999999999996
     A 44.800000000000004,44.800000000000004,0,
     0,1,
     61,105.80000000000001
@@ -115,12 +120,11 @@
             A 33.800000000000004,33.800000000000004,0,
             0,0,
             61,27.199999999999996 Z"
-                                      fill="#2e7d32"
-                                      name="healthy"
-                                      role="img"
-                                      stroke="#e0e0e0"
-                                      tabindex="-1"
-                                    />
+                                        fill="#2e7d32"
+                                        role="img"
+                                        stroke="#e0e0e0"
+                                      />
+                                    </g>
                                   </g>
                                   <g
                                     class="recharts-layer recharts-pie-sector"
@@ -129,13 +133,20 @@
                                   <g
                                     class="recharts-layer recharts-pie-sector"
                                     tabindex="-1"
+                                  />
+                                  <g
+                                    class="recharts-layer recharts-pie-sector"
+                                    tabindex="-1"
                                   >
-                                    <path
-                                      aria-label="50 %"
-                                      class="recharts-sector"
-                                      cx="61"
-                                      cy="61"
-                                      d="M 61,105.80000000000001
+                                    <g
+                                      class="recharts-layer recharts-active-shape"
+                                    >
+                                      <path
+                                        aria-label="transitional: 1 (50%)"
+                                        class="recharts-sector"
+                                        cx="61"
+                                        cy="61"
+                                        d="M 61,105.80000000000001
     A 44.800000000000004,44.800000000000004,0,
     0,1,
     60.99999999999999,16.199999999999996
@@ -143,12 +154,11 @@
             A 33.800000000000004,33.800000000000004,0,
             0,0,
             61,94.80000000000001 Z"
-                                      fill="#9e9e9e"
-                                      name="transitional"
-                                      role="img"
-                                      stroke="#e0e0e0"
-                                      tabindex="-1"
-                                    />
+                                        fill="#9e9e9e"
+                                        role="img"
+                                        stroke="#e0e0e0"
+                                      />
+                                    </g>
                                   </g>
                                   <g
                                     class="recharts-layer recharts-pie-sector"
@@ -212,7 +222,7 @@
                           <p
                             class="MuiTypography-root MuiTypography-body1 MuiTypography-gutterBottom css-7142su-MuiTypography-root"
                           >
-                            1 Failed / 1 Running
+                            1 Failed / 0 Running
                           </p>
                         </div>
                         <div
@@ -232,7 +242,9 @@
                                 cx="70"
                                 cy="70"
                                 height="112"
+                                role="application"
                                 style="width: 100%; height: 100%;"
+                                tabindex="0"
                                 viewBox="0 0 112 112"
                                 width="112"
                               >
@@ -258,12 +270,15 @@
                                     class="recharts-layer recharts-pie-sector"
                                     tabindex="-1"
                                   >
-                                    <path
-                                      aria-label="0 %"
-                                      class="recharts-sector"
-                                      cx="61"
-                                      cy="61"
-                                      d="M 61,16.199999999999996
+                                    <g
+                                      class="recharts-layer recharts-active-shape"
+                                    >
+                                      <path
+                                        aria-label="failed: 1 (100%)"
+                                        class="recharts-sector"
+                                        cx="61"
+                                        cy="61"
+                                        d="M 61,16.199999999999996
     A 44.800000000000004,44.800000000000004,0,
     1,1,
     60.99921809249515,16.20000000682343
@@ -271,12 +286,11 @@
             A 33.800000000000004,33.800000000000004,0,
             1,0,
             61,27.199999999999996 Z"
-                                      fill="#c62828"
-                                      name="failed"
-                                      role="img"
-                                      stroke="#e0e0e0"
-                                      tabindex="-1"
-                                    />
+                                        fill="#c62828"
+                                        role="img"
+                                        stroke="#e0e0e0"
+                                      />
+                                    </g>
                                   </g>
                                   <g
                                     class="recharts-layer recharts-pie-sector"
@@ -356,7 +370,9 @@
                                 cx="70"
                                 cy="70"
                                 height="112"
+                                role="application"
                                 style="width: 100%; height: 100%;"
+                                tabindex="0"
                                 viewBox="0 0 112 112"
                                 width="112"
                               >
@@ -386,12 +402,15 @@
                                     class="recharts-layer recharts-pie-sector"
                                     tabindex="-1"
                                   >
-                                    <path
-                                      aria-label="100 %"
-                                      class="recharts-sector"
-                                      cx="61"
-                                      cy="61"
-                                      d="M 61,16.199999999999996
+                                    <g
+                                      class="recharts-layer recharts-active-shape"
+                                    >
+                                      <path
+                                        aria-label="total: 1 (100%)"
+                                        class="recharts-sector"
+                                        cx="61"
+                                        cy="61"
+                                        d="M 61,16.199999999999996
     A 44.800000000000004,44.800000000000004,0,
     1,1,
     60.99921809249515,16.20000000682343
@@ -399,12 +418,11 @@
             A 33.800000000000004,33.800000000000004,0,
             1,0,
             61,27.199999999999996 Z"
-                                      fill="#000"
-                                      name="total"
-                                      role="img"
-                                      stroke="#e0e0e0"
-                                      tabindex="-1"
-                                    />
+                                        fill="#000"
+                                        role="img"
+                                        stroke="#e0e0e0"
+                                      />
+                                    </g>
                                   </g>
                                   <text
                                     class="recharts-text recharts-label"
@@ -480,7 +498,9 @@
                                 cx="70"
                                 cy="70"
                                 height="112"
+                                role="application"
                                 style="width: 100%; height: 100%;"
+                                tabindex="0"
                                 viewBox="0 0 112 112"
                                 width="112"
                               >
@@ -510,12 +530,15 @@
                                     class="recharts-layer recharts-pie-sector"
                                     tabindex="-1"
                                   >
-                                    <path
-                                      aria-label="100 %"
-                                      class="recharts-sector"
-                                      cx="61"
-                                      cy="61"
-                                      d="M 61,16.199999999999996
+                                    <g
+                                      class="recharts-layer recharts-active-shape"
+                                    >
+                                      <path
+                                        aria-label="total: 1 (100%)"
+                                        class="recharts-sector"
+                                        cx="61"
+                                        cy="61"
+                                        d="M 61,16.199999999999996
     A 44.800000000000004,44.800000000000004,0,
     1,1,
     60.99921809249515,16.20000000682343
@@ -523,12 +546,11 @@
             A 33.800000000000004,33.800000000000004,0,
             1,0,
             61,27.199999999999996 Z"
-                                      fill="#000"
-                                      name="total"
-                                      role="img"
-                                      stroke="#e0e0e0"
-                                      tabindex="-1"
-                                    />
+                                        fill="#000"
+                                        role="img"
+                                        stroke="#e0e0e0"
+                                      />
+                                    </g>
                                   </g>
                                   <text
                                     class="recharts-text recharts-label"
@@ -584,7 +606,7 @@
                           <p
                             class="MuiTypography-root MuiTypography-body1 MuiTypography-gutterBottom css-7142su-MuiTypography-root"
                           >
-                            1 Failed / 1 Running
+                            1 Failed / 0 Running
                           </p>
                         </div>
                         <div
@@ -604,7 +626,9 @@
                                 cx="70"
                                 cy="70"
                                 height="112"
+                                role="application"
                                 style="width: 100%; height: 100%;"
+                                tabindex="0"
                                 viewBox="0 0 112 112"
                                 width="112"
                               >
@@ -630,12 +654,15 @@
                                     class="recharts-layer recharts-pie-sector"
                                     tabindex="-1"
                                   >
-                                    <path
-                                      aria-label="0 %"
-                                      class="recharts-sector"
-                                      cx="61"
-                                      cy="61"
-                                      d="M 61,16.199999999999996
+                                    <g
+                                      class="recharts-layer recharts-active-shape"
+                                    >
+                                      <path
+                                        aria-label="failed: 1 (100%)"
+                                        class="recharts-sector"
+                                        cx="61"
+                                        cy="61"
+                                        d="M 61,16.199999999999996
     A 44.800000000000004,44.800000000000004,0,
     1,1,
     60.99921809249515,16.20000000682343
@@ -643,12 +670,11 @@
             A 33.800000000000004,33.800000000000004,0,
             1,0,
             61,27.199999999999996 Z"
-                                      fill="#c62828"
-                                      name="failed"
-                                      role="img"
-                                      stroke="#e0e0e0"
-                                      tabindex="-1"
-                                    />
+                                        fill="#c62828"
+                                        role="img"
+                                        stroke="#e0e0e0"
+                                      />
+                                    </g>
                                   </g>
                                   <g
                                     class="recharts-layer recharts-pie-sector"
@@ -710,7 +736,7 @@
                           >
                             0 Healthy
                             <span
-                              class="MuiBox-root css-172fsqw"
+                              class="MuiBox-root css-mdv428"
                             >
                               1 Other
                             </span>
@@ -733,7 +759,9 @@
                                 cx="70"
                                 cy="70"
                                 height="112"
+                                role="application"
                                 style="width: 100%; height: 100%;"
+                                tabindex="0"
                                 viewBox="0 0 112 112"
                                 width="112"
                               >
@@ -766,13 +794,20 @@
                                   <g
                                     class="recharts-layer recharts-pie-sector"
                                     tabindex="-1"
+                                  />
+                                  <g
+                                    class="recharts-layer recharts-pie-sector"
+                                    tabindex="-1"
                                   >
-                                    <path
-                                      aria-label="0 %"
-                                      class="recharts-sector"
-                                      cx="61"
-                                      cy="61"
-                                      d="M 61,16.199999999999996
+                                    <g
+                                      class="recharts-layer recharts-active-shape"
+                                    >
+                                      <path
+                                        aria-label="transitional: 1 (100%)"
+                                        class="recharts-sector"
+                                        cx="61"
+                                        cy="61"
+                                        d="M 61,16.199999999999996
     A 44.800000000000004,44.800000000000004,0,
     1,1,
     60.99921809249515,16.20000000682343
@@ -780,12 +815,11 @@
             A 33.800000000000004,33.800000000000004,0,
             1,0,
             61,27.199999999999996 Z"
-                                      fill="#9e9e9e"
-                                      name="transitional"
-                                      role="img"
-                                      stroke="#e0e0e0"
-                                      tabindex="-1"
-                                    />
+                                        fill="#9e9e9e"
+                                        role="img"
+                                        stroke="#e0e0e0"
+                                      />
+                                    </g>
                                   </g>
                                   <g
                                     class="recharts-layer recharts-pie-sector"
@@ -869,7 +903,9 @@
                                 cx="70"
                                 cy="70"
                                 height="112"
+                                role="application"
                                 style="width: 100%; height: 100%;"
+                                tabindex="0"
                                 viewBox="0 0 112 112"
                                 width="112"
                               >
@@ -895,12 +931,15 @@
                                     class="recharts-layer recharts-pie-sector"
                                     tabindex="-1"
                                   >
-                                    <path
-                                      aria-label="100 %"
-                                      class="recharts-sector"
-                                      cx="61"
-                                      cy="61"
-                                      d="M 61,16.199999999999996
+                                    <g
+                                      class="recharts-layer recharts-active-shape"
+                                    >
+                                      <path
+                                        aria-label="healthy: 1 (100%)"
+                                        class="recharts-sector"
+                                        cx="61"
+                                        cy="61"
+                                        d="M 61,16.199999999999996
     A 44.800000000000004,44.800000000000004,0,
     1,1,
     60.99921809249515,16.20000000682343
@@ -908,13 +947,16 @@
             A 33.800000000000004,33.800000000000004,0,
             1,0,
             61,27.199999999999996 Z"
-                                      fill="#2e7d32"
-                                      name="healthy"
-                                      role="img"
-                                      stroke="#e0e0e0"
-                                      tabindex="-1"
-                                    />
+                                        fill="#2e7d32"
+                                        role="img"
+                                        stroke="#e0e0e0"
+                                      />
+                                    </g>
                                   </g>
+                                  <g
+                                    class="recharts-layer recharts-pie-sector"
+                                    tabindex="-1"
+                                  />
                                   <g
                                     class="recharts-layer recharts-pie-sector"
                                     tabindex="-1"
@@ -1005,7 +1047,9 @@
                                 cx="70"
                                 cy="70"
                                 height="112"
+                                role="application"
                                 style="width: 100%; height: 100%;"
+                                tabindex="0"
                                 viewBox="0 0 112 112"
                                 width="112"
                               >
@@ -1031,12 +1075,15 @@
                                     class="recharts-layer recharts-pie-sector"
                                     tabindex="-1"
                                   >
-                                    <path
-                                      aria-label="0%"
-                                      class="recharts-sector"
-                                      cx="61"
-                                      cy="61"
-                                      d="M 61,16.199999999999996
+                                    <g
+                                      class="recharts-layer recharts-active-shape"
+                                    >
+                                      <path
+                                        aria-label="total: 0"
+                                        class="recharts-sector"
+                                        cx="61"
+                                        cy="61"
+                                        d="M 61,16.199999999999996
     A 44.800000000000004,44.800000000000004,0,
     1,1,
     60.99921809249515,16.20000000682343
@@ -1044,12 +1091,11 @@
             A 33.800000000000004,33.800000000000004,0,
             1,0,
             61,27.199999999999996 Z"
-                                      fill="#e0e0e0"
-                                      name="total"
-                                      role="img"
-                                      stroke="#e0e0e0"
-                                      tabindex="-1"
-                                    />
+                                        fill="#e0e0e0"
+                                        role="img"
+                                        stroke="#e0e0e0"
+                                      />
+                                    </g>
                                   </g>
                                   <text
                                     class="recharts-text recharts-label"
@@ -1123,7 +1169,9 @@
                                 cx="70"
                                 cy="70"
                                 height="112"
+                                role="application"
                                 style="width: 100%; height: 100%;"
+                                tabindex="0"
                                 viewBox="0 0 112 112"
                                 width="112"
                               >
@@ -1149,12 +1197,15 @@
                                     class="recharts-layer recharts-pie-sector"
                                     tabindex="-1"
                                   >
-                                    <path
-                                      aria-label="0%"
-                                      class="recharts-sector"
-                                      cx="61"
-                                      cy="61"
-                                      d="M 61,16.199999999999996
+                                    <g
+                                      class="recharts-layer recharts-active-shape"
+                                    >
+                                      <path
+                                        aria-label="total: 0"
+                                        class="recharts-sector"
+                                        cx="61"
+                                        cy="61"
+                                        d="M 61,16.199999999999996
     A 44.800000000000004,44.800000000000004,0,
     1,1,
     60.99921809249515,16.20000000682343
@@ -1162,12 +1213,11 @@
             A 33.800000000000004,33.800000000000004,0,
             1,0,
             61,27.199999999999996 Z"
-                                      fill="#e0e0e0"
-                                      name="total"
-                                      role="img"
-                                      stroke="#e0e0e0"
-                                      tabindex="-1"
-                                    />
+                                        fill="#e0e0e0"
+                                        role="img"
+                                        stroke="#e0e0e0"
+                                      />
+                                    </g>
                                   </g>
                                   <text
                                     class="recharts-text recharts-label"
@@ -1234,78 +1284,90 @@
                       class="MuiGrid-root MuiGrid-item css-13i4rnv-MuiGrid-root"
                     >
                       <div
-                        class="MuiAutocomplete-root MuiAutocomplete-hasPopupIcon css-1x6bjyf-MuiAutocomplete-root"
+                        class="MuiBox-root css-0"
                       >
                         <div
-                          class="MuiBox-root css-1dipl1t"
+                          class="MuiGrid-root MuiGrid-container MuiGrid-spacing-xs-1 css-7ldjcq-MuiGrid-root"
                         >
                           <div
-                            class="MuiFormControl-root MuiFormControl-fullWidth MuiTextField-root css-wb57ya-MuiFormControl-root-MuiTextField-root"
-                            style="margin-top: 0px;"
+                            class="MuiGrid-root MuiGrid-item css-13i4rnv-MuiGrid-root"
                           >
-                            <label
-                              class="MuiFormLabel-root MuiInputLabel-root MuiInputLabel-formControl MuiInputLabel-animated MuiInputLabel-shrink MuiInputLabel-sizeSmall MuiInputLabel-outlined MuiFormLabel-colorPrimary MuiInputLabel-root MuiInputLabel-formControl MuiInputLabel-animated MuiInputLabel-shrink MuiInputLabel-sizeSmall MuiInputLabel-outlined css-1f7ywh2-MuiFormLabel-root-MuiInputLabel-root"
-                              data-shrink="true"
-                              for="namespaces-filter"
-                              id="namespaces-filter-label"
-                            >
-                              Namespaces
-                            </label>
                             <div
-                              class="MuiInputBase-root MuiOutlinedInput-root MuiInputBase-colorPrimary MuiInputBase-fullWidth MuiInputBase-formControl MuiInputBase-sizeSmall MuiInputBase-adornedEnd MuiAutocomplete-inputRoot css-1xjtaff-MuiInputBase-root-MuiOutlinedInput-root"
+                              class="MuiAutocomplete-root MuiAutocomplete-hasPopupIcon css-1x6bjyf-MuiAutocomplete-root"
                             >
-                              <input
-                                aria-autocomplete="both"
-                                aria-expanded="false"
-                                aria-invalid="false"
-                                autocapitalize="none"
-                                autocomplete="off"
-                                class="MuiInputBase-input MuiOutlinedInput-input MuiInputBase-inputSizeSmall MuiInputBase-inputAdornedEnd MuiAutocomplete-input MuiAutocomplete-inputFocused css-19qh8xo-MuiInputBase-input-MuiOutlinedInput-input"
-                                id="namespaces-filter"
-                                placeholder="Filter"
-                                role="combobox"
-                                spellcheck="false"
-                                type="text"
-                                value=""
-                              />
                               <div
-                                class="MuiAutocomplete-endAdornment css-p1olib-MuiAutocomplete-endAdornment"
+                                class="MuiBox-root css-1dipl1t"
                               >
-                                <button
-                                  aria-label="Open"
-                                  class="MuiButtonBase-root MuiIconButton-root MuiIconButton-sizeMedium MuiAutocomplete-popupIndicator css-1aav1nn-MuiButtonBase-root-MuiIconButton-root-MuiAutocomplete-popupIndicator"
-                                  tabindex="-1"
-                                  title="Open"
-                                  type="button"
+                                <div
+                                  class="MuiFormControl-root MuiFormControl-fullWidth MuiTextField-root css-wb57ya-MuiFormControl-root-MuiTextField-root"
+                                  style="margin-top: 0px;"
                                 >
-                                  <svg
-                                    aria-hidden="true"
-                                    class="MuiSvgIcon-root MuiSvgIcon-fontSizeMedium css-i4bv87-MuiSvgIcon-root"
-                                    data-testid="ArrowDropDownIcon"
-                                    focusable="false"
-                                    viewBox="0 0 24 24"
+                                  <label
+                                    class="MuiFormLabel-root MuiInputLabel-root MuiInputLabel-formControl MuiInputLabel-animated MuiInputLabel-shrink MuiInputLabel-sizeSmall MuiInputLabel-outlined MuiFormLabel-colorPrimary MuiInputLabel-root MuiInputLabel-formControl MuiInputLabel-animated MuiInputLabel-shrink MuiInputLabel-sizeSmall MuiInputLabel-outlined css-1f7ywh2-MuiFormLabel-root-MuiInputLabel-root"
+                                    data-shrink="true"
+                                    for="namespaces-filter"
+                                    id="namespaces-filter-label"
                                   >
-                                    <path
-                                      d="M7 10l5 5 5-5z"
-                                    />
-                                  </svg>
-                                  <span
-                                    class="MuiTouchRipple-root css-8je8zh-MuiTouchRipple-root"
-                                  />
-                                </button>
-                              </div>
-                              <fieldset
-                                aria-hidden="true"
-                                class="MuiOutlinedInput-notchedOutline css-r01yff-MuiNotchedOutlined-root-MuiOutlinedInput-notchedOutline"
-                              >
-                                <legend
-                                  class="css-sl37lx-MuiNotchedOutlined-root"
-                                >
-                                  <span>
                                     Namespaces
-                                  </span>
-                                </legend>
-                              </fieldset>
+                                  </label>
+                                  <div
+                                    class="MuiInputBase-root MuiOutlinedInput-root MuiInputBase-colorPrimary MuiInputBase-fullWidth MuiInputBase-formControl MuiInputBase-sizeSmall MuiInputBase-adornedEnd MuiAutocomplete-inputRoot css-1xjtaff-MuiInputBase-root-MuiOutlinedInput-root"
+                                  >
+                                    <input
+                                      aria-autocomplete="both"
+                                      aria-expanded="false"
+                                      aria-invalid="false"
+                                      autocapitalize="none"
+                                      autocomplete="off"
+                                      class="MuiInputBase-input MuiOutlinedInput-input MuiInputBase-inputSizeSmall MuiInputBase-inputAdornedEnd MuiAutocomplete-input MuiAutocomplete-inputFocused css-19qh8xo-MuiInputBase-input-MuiOutlinedInput-input"
+                                      id="namespaces-filter"
+                                      placeholder="Filter"
+                                      role="combobox"
+                                      spellcheck="false"
+                                      type="text"
+                                      value=""
+                                    />
+                                    <div
+                                      class="MuiAutocomplete-endAdornment css-p1olib-MuiAutocomplete-endAdornment"
+                                    >
+                                      <button
+                                        aria-label="Open"
+                                        class="MuiButtonBase-root MuiIconButton-root MuiIconButton-sizeMedium MuiAutocomplete-popupIndicator css-1aav1nn-MuiButtonBase-root-MuiIconButton-root-MuiAutocomplete-popupIndicator"
+                                        tabindex="-1"
+                                        title="Open"
+                                        type="button"
+                                      >
+                                        <svg
+                                          aria-hidden="true"
+                                          class="MuiSvgIcon-root MuiSvgIcon-fontSizeMedium css-i4bv87-MuiSvgIcon-root"
+                                          data-testid="ArrowDropDownIcon"
+                                          focusable="false"
+                                          viewBox="0 0 24 24"
+                                        >
+                                          <path
+                                            d="M7 10l5 5 5-5z"
+                                          />
+                                        </svg>
+                                        <span
+                                          class="MuiTouchRipple-root css-8je8zh-MuiTouchRipple-root"
+                                        />
+                                      </button>
+                                    </div>
+                                    <fieldset
+                                      aria-hidden="true"
+                                      class="MuiOutlinedInput-notchedOutline css-r01yff-MuiNotchedOutlined-root-MuiOutlinedInput-notchedOutline"
+                                    >
+                                      <legend
+                                        class="css-sl37lx-MuiNotchedOutlined-root"
+                                      >
+                                        <span>
+                                          Namespaces
+                                        </span>
+                                      </legend>
+                                    </fieldset>
+                                  </div>
+                                </div>
+                              </div>
                             </div>
                           </div>
                         </div>
@@ -1882,7 +1944,7 @@
                         >
                           <p
                             aria-label="2025-05-20T12:00:00.000Z"
-                            class="MuiTypography-root MuiTypography-body1 css-1d0cpfm-MuiTypography-root"
+                            class="MuiTypography-root MuiTypography-body1 css-1t59wre-MuiTypography-root"
                             data-mui-internal-clone-element="true"
                           >
                             90d
@@ -1973,7 +2035,7 @@
                         >
                           <p
                             aria-label="2025-05-20T09:30:00.000Z"
-                            class="MuiTypography-root MuiTypography-body1 css-1d0cpfm-MuiTypography-root"
+                            class="MuiTypography-root MuiTypography-body1 css-1t59wre-MuiTypography-root"
                             data-mui-internal-clone-element="true"
                           >
                             90d
@@ -2064,7 +2126,7 @@
                         >
                           <p
                             aria-label="2025-05-20T09:00:00.000Z"
-                            class="MuiTypography-root MuiTypography-body1 css-1d0cpfm-MuiTypography-root"
+                            class="MuiTypography-root MuiTypography-body1 css-1t59wre-MuiTypography-root"
                             data-mui-internal-clone-element="true"
                           >
                             90d
@@ -2155,7 +2217,7 @@
                         >
                           <p
                             aria-label="2025-05-20T08:00:00.000Z"
-                            class="MuiTypography-root MuiTypography-body1 css-1d0cpfm-MuiTypography-root"
+                            class="MuiTypography-root MuiTypography-body1 css-1t59wre-MuiTypography-root"
                             data-mui-internal-clone-element="true"
                           >
                             90d
@@ -2246,7 +2308,7 @@
                         >
                           <p
                             aria-label="2025-05-20T07:00:00.000Z"
-                            class="MuiTypography-root MuiTypography-body1 css-1d0cpfm-MuiTypography-root"
+                            class="MuiTypography-root MuiTypography-body1 css-1t59wre-MuiTypography-root"
                             data-mui-internal-clone-element="true"
                           >
                             90d
@@ -2337,7 +2399,7 @@
                         >
                           <p
                             aria-label="2025-05-20T06:00:00.000Z"
-                            class="MuiTypography-root MuiTypography-body1 css-1d0cpfm-MuiTypography-root"
+                            class="MuiTypography-root MuiTypography-body1 css-1t59wre-MuiTypography-root"
                             data-mui-internal-clone-element="true"
                           >
                             90d

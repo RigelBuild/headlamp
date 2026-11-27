@@ -58,6 +58,7 @@ type PortForwardProps = PortForwardKubeObjectProps | PortForwardLegacyProps;
 export const PORT_FORWARDS_STORAGE_KEY = 'portforwards';
 export const PORT_FORWARD_STOP_STATUS = 'Stopped';
 export const PORT_FORWARD_RUNNING_STATUS = 'Running';
+export const PORT_FORWARD_RECONNECTING_STATUS = 'Reconnecting';
 export const DOCKER_DESKTOP_MIN_PORT = 30000;
 export const DOCKER_DESKTOP_MAX_PORT = 32000;
 
@@ -79,18 +80,14 @@ function getErrorMessage(error: unknown): string {
   return String(error);
 }
 
-function getPortNumberFromPortName(containers: KubeContainer[], namedPort: string) {
-  let portNumber = 0;
-  containers.every((container: KubeContainer) => {
-    container.ports?.find((port: { name?: string; containerPort: number }) => {
-      if (port.name === namedPort) {
-        portNumber = port.containerPort;
-        return false;
-      }
-    });
-    return true;
-  });
-  return portNumber;
+function getPortNumberFromPortName(containers: KubeContainer[] = [], namedPort: string) {
+  for (const container of containers) {
+    const port = container.ports?.find(p => p.name === namedPort);
+    if (port) {
+      return port.containerPort;
+    }
+  }
+  return 0;
 }
 
 function getPodsSelectorFilter(service?: Service) {
@@ -173,6 +170,7 @@ function PortForwardContent(props: PortForwardProps) {
   const [pods, podsFetchError] = Pod.useList({
     namespace,
     labelSelector: getPodsSelectorFilter(service),
+    cluster: resource?.cluster,
   });
 
   const cluster = React.useMemo(() => {
@@ -185,12 +183,15 @@ function PortForwardContent(props: PortForwardProps) {
     return getCluster();
   }, [resource]);
 
-  const numericContainerPort =
-    typeof containerPort === 'string' && isNaN(parseInt(containerPort))
-      ? !pods || pods.length === 0
-        ? 0
-        : getPortNumberFromPortName(pods[0].spec.containers, containerPort)
-      : containerPort;
+  const isNamedPort = typeof containerPort === 'string' && !/^\d+$/.test(containerPort.trim());
+
+  const numericContainerPort = isNamedPort
+    ? !pods || pods.length === 0
+      ? 0
+      : getPortNumberFromPortName(pods[0]?.spec?.containers, containerPort)
+    : typeof containerPort === 'string'
+    ? parseInt(containerPort, 10)
+    : containerPort;
 
   const displayPodName = React.useMemo(() => {
     return isPod ? name : pods && pods.length > 0 ? pods[0].metadata.name : '';
@@ -470,6 +471,29 @@ function PortForwardContent(props: PortForwardProps) {
                 description={t('translation|Delete port forward')}
                 color="primary"
                 icon="mdi:delete-outline"
+                iconButtonProps={{
+                  size: 'small',
+                  color: 'primary',
+                  disabled: loading,
+                }}
+                width={'25'}
+              />
+            </Box>
+          ) : portForward.status === PORT_FORWARD_RECONNECTING_STATUS ? (
+            <Box display={'flex'} alignItems="center" gap={1}>
+              <CircularProgress size={16} />
+              <Typography
+                style={{
+                  color: grey[500],
+                }}
+              >
+                {t('translation|Reconnecting...')}
+              </Typography>
+              <ActionButton
+                onClick={portForwardStopHandler}
+                description={t('translation|Stop port forward')}
+                color="primary"
+                icon="mdi:stop-circle-outline"
                 iconButtonProps={{
                   size: 'small',
                   color: 'primary',

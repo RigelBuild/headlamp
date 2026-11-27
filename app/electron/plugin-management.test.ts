@@ -33,14 +33,275 @@ import {
   defaultPluginsDir,
   defaultUserPluginsDir,
   getExtraFiles,
+  isExistingDirectory,
+  isPathWithinDirectory,
+  normalizeChecksum,
   PluginManager,
+  preparePluginExecutable,
+  preparePluginScript,
+  recordPluginExecutableIntegrity,
+  recordPluginInstallationIntegrity,
+  removePreparedPluginExecutable,
+  removePreparedPluginScript,
+  resolveExtraFilePath,
   setAppConfigDirName,
+  verifyPluginExecutableIntegrity,
+  verifyPluginInstallationIntegrity,
 } from './plugin-management';
 
 const TEST_DATA_BASE_DIR = path.join(os.tmpdir(), 'headlamp-test-data');
 const PLUGIN_DEST_BASE_DIR = path.join(os.tmpdir(), 'headlamp-test-plugins');
 const HEADLAMP_VERSION = '0.30.0';
 const ORIGINAL_PLATFORM = process.platform;
+
+describe('plugin installation integrity', () => {
+  const temporaryDirectories: string[] = [];
+  const identity = {
+    repository: 'headlamp-plugins',
+    package: 'headlamp_minikube',
+    packageId: 'fbc182b5-eb90-42b7-ace8-62a7576abafd',
+    repositoryId: '767e1f40-ee09-401b-b8d4-930740da5a8a',
+  };
+
+  afterEach(() => {
+    for (const directory of temporaryDirectories.splice(0)) {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  function fixture() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'headlamp-installation-receipt-'));
+    temporaryDirectories.push(root);
+    const bundle = path.join(root, 'plugin');
+    const receiptFile = path.join(root, 'app-state', 'plugin-installation-receipts.json');
+    const script = path.join(bundle, 'manage.js');
+    fs.mkdirSync(bundle);
+    fs.writeFileSync(path.join(bundle, 'package.json'), '{"name":"@headlamp-k8s/minikube"}');
+    fs.writeFileSync(script, 'trusted');
+    return { root, bundle, receiptFile, script };
+  }
+
+  it('records installed files with the expected Artifact Hub identity', async () => {
+    const { bundle, receiptFile } = fixture();
+    await recordPluginInstallationIntegrity(bundle, identity, receiptFile);
+
+    await expect(verifyPluginInstallationIntegrity(bundle, identity, receiptFile)).resolves.toBe(
+      true
+    );
+    await expect(
+      verifyPluginInstallationIntegrity(
+        bundle,
+        {
+          repository: identity.repository,
+          package: identity.package,
+        },
+        receiptFile
+      )
+    ).resolves.toBe(true);
+    await expect(
+      verifyPluginInstallationIntegrity(
+        bundle,
+        {
+          repository: identity.repository,
+          package: 'another-package',
+        },
+        receiptFile
+      )
+    ).resolves.toBe(false);
+    await expect(
+      verifyPluginInstallationIntegrity(
+        bundle,
+        {
+          ...identity,
+          repositoryId: '61e223f8-49fe-47c5-9bf8-802e8f759cab',
+        },
+        receiptFile
+      )
+    ).resolves.toBe(false);
+    expect(JSON.parse(fs.readFileSync(receiptFile, 'utf8')).receipts[0]).toEqual(
+      expect.objectContaining({
+        ...identity,
+        inventoryPath: fs.realpathSync(path.dirname(bundle)),
+        bundleName: path.basename(bundle),
+      })
+    );
+    expect(
+      JSON.parse(fs.readFileSync(path.join(bundle, 'package.json'), 'utf8')).headlampPluginIntegrity
+    ).toBeUndefined();
+  });
+
+  it('rejects modified files and receipt-less legacy installations', async () => {
+    const { bundle, receiptFile, script } = fixture();
+
+    await expect(verifyPluginInstallationIntegrity(bundle, identity, receiptFile)).resolves.toBe(
+      false
+    );
+    await recordPluginInstallationIntegrity(bundle, identity, receiptFile);
+    fs.writeFileSync(script, 'replaced');
+    await expect(verifyPluginInstallationIntegrity(bundle, identity, receiptFile)).resolves.toBe(
+      false
+    );
+  });
+
+  it('rejects a forged package-local receipt and a copied bundle', async () => {
+    const { root, bundle, receiptFile } = fixture();
+    const packagePath = path.join(bundle, 'package.json');
+    const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+    packageJson.headlampPluginIntegrity = { version: 1, installation: { ...identity, files: {} } };
+    fs.writeFileSync(packagePath, JSON.stringify(packageJson));
+
+    await expect(verifyPluginInstallationIntegrity(bundle, identity, receiptFile)).resolves.toBe(
+      false
+    );
+    await recordPluginInstallationIntegrity(bundle, identity, receiptFile);
+    const copiedBundle = path.join(root, 'other-inventory', 'plugin');
+    fs.cpSync(bundle, copiedBundle, { recursive: true });
+
+    await expect(
+      verifyPluginInstallationIntegrity(copiedBundle, identity, receiptFile)
+    ).resolves.toBe(false);
+  });
+
+  it('records a root file named __proto__ in the integrity map', async () => {
+    const { bundle, receiptFile } = fixture();
+    const specialFile = path.join(bundle, '__proto__');
+    fs.writeFileSync(specialFile, 'trusted');
+    await recordPluginInstallationIntegrity(bundle, identity, receiptFile);
+    fs.writeFileSync(specialFile, 'replaced');
+
+    await expect(verifyPluginInstallationIntegrity(bundle, identity, receiptFile)).resolves.toBe(
+      false
+    );
+  });
+
+  it('prepares immutable script bytes and removes them after use', async () => {
+    const { root, bundle, receiptFile, script } = fixture();
+    const preparedRoot = path.join(root, 'prepared');
+    await recordPluginInstallationIntegrity(bundle, identity, receiptFile);
+
+    const prepared = await preparePluginScript(
+      bundle,
+      'manage.js',
+      identity,
+      preparedRoot,
+      receiptFile
+    );
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    fs.writeFileSync(script, 'replaced');
+    expect(fs.readFileSync(prepared.scriptPath, 'utf8')).toBe('trusted');
+    removePreparedPluginScript(prepared.scriptPath, preparedRoot);
+    expect(fs.existsSync(prepared.scriptPath)).toBe(false);
+  });
+});
+
+describe('plugin executable integrity', () => {
+  const temporaryDirectories: string[] = [];
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: ORIGINAL_PLATFORM });
+    for (const directory of temporaryDirectories.splice(0)) {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  function fixture() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'headlamp-executable-receipt-'));
+    temporaryDirectories.push(root);
+    const bundle = path.join(root, 'plugin');
+    const executable = path.join(bundle, 'bin', 'examplectl');
+    fs.mkdirSync(path.dirname(executable), { recursive: true });
+    fs.writeFileSync(path.join(bundle, 'package.json'), '{"name":"@example/plugin"}');
+    fs.writeFileSync(executable, 'trusted');
+    return { bundle, executable };
+  }
+
+  it('accepts installed bytes and rejects replacements', async () => {
+    const { bundle, executable } = fixture();
+    await recordPluginExecutableIntegrity(bundle, ['bin/examplectl']);
+
+    await expect(
+      verifyPluginExecutableIntegrity(bundle, 'bin/examplectl', executable)
+    ).resolves.toEqual({ ok: true });
+    fs.writeFileSync(executable, 'replaced');
+    await expect(
+      verifyPluginExecutableIntegrity(bundle, 'bin/examplectl', executable)
+    ).resolves.toEqual({ ok: false, reason: 'digest-mismatch' });
+  });
+
+  it('prepares immutable app-owned executable bytes', async () => {
+    const { bundle, executable } = fixture();
+    const preparedRoot = path.join(path.dirname(bundle), 'prepared');
+    await recordPluginExecutableIntegrity(bundle, ['bin/examplectl']);
+
+    const prepared = await preparePluginExecutable(
+      bundle,
+      'bin/examplectl',
+      executable,
+      preparedRoot
+    );
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    fs.writeFileSync(executable, 'replaced');
+    expect(fs.readFileSync(prepared.executablePath, 'utf8')).toBe('trusted');
+    removePreparedPluginExecutable(prepared.executablePath, preparedRoot);
+    expect(fs.existsSync(prepared.executablePath)).toBe(false);
+  });
+
+  it('uses app-owned receipts for managed user-plugin executables', async () => {
+    const { bundle, executable } = fixture();
+    const preparedRoot = path.join(path.dirname(bundle), 'prepared');
+    const receiptFile = path.join(path.dirname(bundle), 'receipts.json');
+    const identity = {
+      repository: 'example-repository',
+      package: 'example-plugin',
+      packageId: '123e4567-e89b-42d3-a456-426614174000',
+      repositoryId: '123e4567-e89b-42d3-a456-426614174001',
+    };
+    await recordPluginInstallationIntegrity(bundle, identity, receiptFile);
+
+    fs.writeFileSync(executable, 'replaced');
+    await recordPluginExecutableIntegrity(bundle, ['bin/examplectl']);
+
+    await expect(
+      preparePluginExecutable(
+        bundle,
+        'bin/examplectl',
+        executable,
+        preparedRoot,
+        identity,
+        receiptFile
+      )
+    ).resolves.toEqual({ ok: false, reason: 'digest-mismatch' });
+  });
+
+  it('does not prepare modified or outside executable bytes', async () => {
+    const { bundle, executable } = fixture();
+    const preparedRoot = path.join(path.dirname(bundle), 'prepared');
+    await recordPluginExecutableIntegrity(bundle, ['bin/examplectl']);
+    fs.writeFileSync(executable, 'replaced');
+    await expect(
+      preparePluginExecutable(bundle, 'bin/examplectl', executable, preparedRoot)
+    ).resolves.toEqual({ ok: false, reason: 'digest-mismatch' });
+
+    const outsideExecutable = path.join(path.dirname(bundle), 'outside');
+    fs.writeFileSync(outsideExecutable, 'trusted');
+    await expect(
+      preparePluginExecutable(bundle, 'bin/examplectl', outsideExecutable, preparedRoot)
+    ).resolves.toEqual({ ok: false, reason: 'unavailable-executable' });
+  });
+
+  it('uses logical executable paths for Windows .exe files', async () => {
+    const { bundle, executable } = fixture();
+    fs.renameSync(executable, `${executable}.exe`);
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    await recordPluginExecutableIntegrity(bundle, ['bin/examplectl']);
+    await expect(
+      verifyPluginExecutableIntegrity(bundle, 'bin/examplectl', `${executable}.exe`)
+    ).resolves.toEqual({ ok: true });
+  });
+});
 
 describe('default plugin directories', () => {
   afterEach(() => {
@@ -113,6 +374,37 @@ describe('plugin management loading', () => {
   });
 });
 
+describe('Artifact Hub package identity', () => {
+  it('preserves immutable package and repository IDs from the API', async () => {
+    nock('https://artifacthub.io')
+      .get('/api/v1/packages/headlamp/example-repo/example-plugin')
+      .reply(200, {
+        package_id: 'package-id',
+        name: 'example-plugin',
+        display_name: 'Example plugin',
+        version: '1.0.0',
+        repository: {
+          repository_id: 'repository-id',
+          name: 'example-repo',
+          user_alias: 'publisher',
+        },
+        data: {
+          'headlamp/plugin/archive-url': 'https://github.com/example/plugin/archive.tar.gz',
+          'headlamp/plugin/archive-checksum': `sha256:${'0'.repeat(64)}`,
+          'headlamp/plugin/version-compat': '>=0.22',
+          'headlamp/plugin/distro-compat': 'desktop',
+        },
+      });
+
+    const plugin = await PluginManager.fetchPluginInfo(
+      'https://artifacthub.io/packages/headlamp/example-repo/example-plugin'
+    );
+
+    expect(plugin.packageId).toBe('package-id');
+    expect(plugin.repository.repositoryId).toBe('repository-id');
+  });
+});
+
 /**
  * Creates a unique test directory for a test
  * @param basePath Base directory path
@@ -170,6 +462,9 @@ describe('PluginManager', () => {
     const minikubeBinary = platform === 'win32' ? 'minikube.exe' : 'minikube';
     const minikubePath = path.join(pluginDir, 'bin', minikubeBinary);
     expect(fs.existsSync(minikubePath)).toBe(true);
+    await expect(
+      verifyPluginExecutableIntegrity(pluginDir, 'bin/minikube', minikubePath)
+    ).resolves.toEqual({ ok: true });
 
     // Verify progress includes platform-specific download
     const platformMessages = progress.filter(
@@ -242,6 +537,60 @@ describe('PluginManager', () => {
     }
   }, 30000);
 
+  it('keeps an updated plugin when its unique backup cannot be removed', async () => {
+    const testDataDir = getUniqueTestDir(TEST_DATA_BASE_DIR, 'update-backup-data');
+    const pluginDestDir = getUniqueTestDir(PLUGIN_DEST_BASE_DIR, 'update-backup-plugins');
+    await createMinimalPluginTarball(testDataDir);
+    await createPlatformSpecificTarball(testDataDir);
+    mockArtifactHubAPI(testDataDir);
+
+    const pluginURL = 'https://artifacthub.io/packages/headlamp/test-repo/headlamp_minikube';
+    await PluginManager.install(pluginURL, pluginDestDir, HEADLAMP_VERSION, null, null);
+
+    mockArtifactHubAPI(testDataDir, '0.2.0');
+    const remove = fs.rmSync.bind(fs);
+    const removeSpy = vi.spyOn(fs, 'rmSync').mockImplementation((target, options) => {
+      if (String(target).includes('.update-backup-')) {
+        throw new Error('backup is busy');
+      }
+      return remove(target, options);
+    });
+    const renameSpy = vi.spyOn(fs, 'renameSync');
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(
+      PluginManager.update('headlamp_minikube', pluginDestDir, HEADLAMP_VERSION, null, null)
+    ).resolves.toBeUndefined();
+
+    const pluginDir = path.join(pluginDestDir, 'headlamp_minikube');
+    const packageJson = JSON.parse(fs.readFileSync(path.join(pluginDir, 'package.json'), 'utf8'));
+    const executable = path.join(
+      pluginDir,
+      'bin',
+      process.platform === 'win32' ? 'minikube.exe' : 'minikube'
+    );
+    const backupPath = renameSpy.mock.calls
+      .map(([, destination]) => String(destination))
+      .find(destination => destination.includes('.update-backup-'));
+    expect(backupPath).toMatch(/\.update-backup-[a-f0-9]{16}$/);
+    expect(path.basename(path.dirname(backupPath!))).toBe('.headlamp-plugin-updates');
+    expect(PluginManager.list(pluginDestDir)).toHaveLength(1);
+    expect(packageJson.artifacthub.version).toBe('0.2.0');
+    await expect(
+      verifyPluginExecutableIntegrity(pluginDir, 'bin/minikube', executable)
+    ).resolves.toEqual({ ok: true });
+    expect(consoleWarn).toHaveBeenCalledWith(
+      'Failed to remove plugin update backup:',
+      expect.any(Error)
+    );
+
+    removeSpy.mockRestore();
+    renameSpy.mockRestore();
+    consoleWarn.mockRestore();
+    remove(pluginDestDir, { recursive: true, force: true });
+    remove(testDataDir, { recursive: true, force: true });
+  }, 30000);
+
   it('should uninstall plugin from the same directory where it was installed', async () => {
     // Create unique directories for this test
     const testDataDir = getUniqueTestDir(TEST_DATA_BASE_DIR, 'uninstall-test-data');
@@ -270,11 +619,23 @@ describe('PluginManager', () => {
     // Reset progress array for uninstall
     progress.length = 0;
 
-    // Uninstall the plugin from the same directory
-    PluginManager.uninstall('headlamp_minikube', pluginDestDir, progressCallback);
+    // Uninstall the plugin from the same directory. Give it a package name that differs
+    // from its folder, as scoped packages have, so the cleanup must get the folder.
+    const packageJsonPath = path.join(pluginDir, 'package.json');
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    fs.writeFileSync(
+      packageJsonPath,
+      JSON.stringify({ ...packageJson, name: '@example/minikube' })
+    );
+    const beforeRemove = vi.fn((folderName: string) => {
+      // Called while the bundle can still be found, so its cleanup can be retried
+      expect(fs.existsSync(path.join(pluginDestDir, folderName))).toBe(true);
+    });
+    PluginManager.uninstall('@example/minikube', pluginDestDir, progressCallback, beforeRemove);
 
     // Verify the plugin was uninstalled
     expect(fs.existsSync(pluginDir)).toBe(false);
+    expect(beforeRemove).toHaveBeenCalledExactlyOnceWith('headlamp_minikube');
 
     // Verify success message
     const successMessages = progress.filter(p => p.type === 'success');
@@ -288,6 +649,47 @@ describe('PluginManager', () => {
     if (fs.existsSync(testDataDir)) {
       fs.rmSync(testDataDir, { recursive: true });
     }
+  }, 30000);
+
+  it('keeps the bundle when the cleanup before uninstalling it fails', async () => {
+    const testDataDir = getUniqueTestDir(TEST_DATA_BASE_DIR, 'uninstall-cleanup-test-data');
+    const pluginDestDir = getUniqueTestDir(PLUGIN_DEST_BASE_DIR, 'uninstall-cleanup-test-plugins');
+    await createMinimalPluginTarball(testDataDir);
+    mockArtifactHubAPIWithoutPlatformSpecific(testDataDir);
+    const pluginURL = 'https://artifacthub.io/packages/headlamp/test-repo/headlamp_minikube';
+    await PluginManager.install(pluginURL, pluginDestDir, HEADLAMP_VERSION, null, null);
+    const pluginDir = path.join(pluginDestDir, 'headlamp_minikube');
+    const progress: any[] = [];
+
+    // For example, settings.json can't be written, so the bundle's consents can't be cleared.
+    PluginManager.uninstall(
+      'headlamp_minikube',
+      pluginDestDir,
+      update => progress.push(update),
+      () => {
+        throw new Error('settings.json is read-only');
+      }
+    );
+
+    expect(progress).toEqual([{ type: 'error', message: 'settings.json is read-only' }]);
+    expect(fs.existsSync(pluginDir)).toBe(true);
+
+    // A retry still finds the bundle, so its cleanup runs again.
+    const beforeRemove = vi.fn();
+    progress.length = 0;
+    PluginManager.uninstall(
+      'headlamp_minikube',
+      pluginDestDir,
+      update => progress.push(update),
+      beforeRemove
+    );
+
+    expect(beforeRemove).toHaveBeenCalledExactlyOnceWith('headlamp_minikube');
+    expect(progress).toEqual([{ type: 'success', message: 'Plugin Uninstalled' }]);
+    expect(fs.existsSync(pluginDir)).toBe(false);
+
+    fs.rmSync(pluginDestDir, { recursive: true, force: true });
+    fs.rmSync(testDataDir, { recursive: true, force: true });
   }, 30000);
 });
 
@@ -379,9 +781,13 @@ async function createPlatformSpecificTarball(testDataDir: string) {
 }
 
 /**
- * Mock the ArtifactHub API responses for testing
+ * Mock the ArtifactHub API responses for testing.
+ *
+ * @param testDataDir - Directory containing the mocked plugin archives.
+ * @param version - Artifact Hub package version returned by the mock.
+ * @param requestCount - Number of complete metadata and archive download cycles to serve.
  */
-function mockArtifactHubAPI(testDataDir: string) {
+function mockArtifactHubAPI(testDataDir: string, version = '0.1.0') {
   try {
     // Calculate checksums for the tarballs
     const pluginTarballPath = path.join(testDataDir, 'plugin-tarball.tar.gz');
@@ -413,10 +819,12 @@ function mockArtifactHubAPI(testDataDir: string) {
     nock('https://artifacthub.io')
       .get('/api/v1/packages/headlamp/test-repo/headlamp_minikube')
       .reply(200, {
+        package_id: 'fbc182b5-eb90-42b7-ace8-62a7576abafd',
         name: 'headlamp_minikube',
         display_name: 'Minikube',
-        version: '0.1.0',
+        version,
         repository: {
+          repository_id: '767e1f40-ee09-401b-b8d4-930740da5a8a',
           name: 'test-repo',
           user_alias: 'tester',
         },
@@ -428,7 +836,8 @@ function mockArtifactHubAPI(testDataDir: string) {
           'headlamp/plugin/extra-files/0/url': platformSpecificArchiveURL,
           'headlamp/plugin/extra-files/0/checksum': `sha256:${platformSpecificChecksum}`,
           'headlamp/plugin/extra-files/0/arch': `${platform}/${arch}`,
-          'headlamp/plugin/extra-files/0/output/minikube/output': 'minikube',
+          'headlamp/plugin/extra-files/0/output/minikube/output':
+            os.platform() === 'win32' ? 'minikube.exe' : 'minikube',
           'headlamp/plugin/extra-files/0/output/minikube/input':
             os.platform() === 'win32' ? 'minikube.exe' : 'minikube',
           // Add dummy entries for other platforms to ensure we only download the correct one
@@ -458,7 +867,10 @@ function mockArtifactHubAPI(testDataDir: string) {
 /**
  * Mock the ArtifactHub API without platform-specific archives
  */
-function mockArtifactHubAPIWithoutPlatformSpecific(testDataDir: string) {
+function mockArtifactHubAPIWithoutPlatformSpecific(
+  testDataDir: string,
+  formatChecksum: (hex: string) => string = hex => `sha256:${hex}`
+) {
   try {
     // Calculate checksums for the tarball
     const pluginTarballPath = path.join(testDataDir, 'plugin-tarball.tar.gz');
@@ -480,16 +892,18 @@ function mockArtifactHubAPIWithoutPlatformSpecific(testDataDir: string) {
     nock('https://artifacthub.io')
       .get('/api/v1/packages/headlamp/test-repo/headlamp_minikube')
       .reply(200, {
+        package_id: 'fbc182b5-eb90-42b7-ace8-62a7576abafd',
         name: 'headlamp_minikube',
         display_name: 'Minikube',
         version: '0.1.0',
         repository: {
+          repository_id: '767e1f40-ee09-401b-b8d4-930740da5a8a',
           name: 'test-repo',
           user_alias: 'tester',
         },
         data: {
           'headlamp/plugin/archive-url': pluginArchiveURL,
-          'headlamp/plugin/archive-checksum': `sha256:${pluginChecksum}`,
+          'headlamp/plugin/archive-checksum': formatChecksum(pluginChecksum),
           'headlamp/plugin/version-compat': '>=0.22',
           'headlamp/plugin/distro-compat': 'in-cluster,web,docker-desktop,desktop',
           // Empty extra-files to indicate no platform-specific files
@@ -537,7 +951,91 @@ function calculateSHA256(filePath: string): string {
   }
 }
 
+describe('normalizeChecksum', () => {
+  const hex = 'a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f80000';
+
+  it('accepts the sha256: prefix in any case', () => {
+    expect(normalizeChecksum(`sha256:${hex}`)).toBe(hex);
+    expect(normalizeChecksum(`SHA256:${hex}`)).toBe(hex);
+    expect(normalizeChecksum(`Sha256:${hex}`)).toBe(hex);
+  });
+
+  it('accepts a digest without a prefix', () => {
+    expect(normalizeChecksum(hex)).toBe(hex);
+  });
+
+  it('lowercases uppercase hex, as printed by Get-FileHash', () => {
+    expect(normalizeChecksum(`SHA256:${hex.toUpperCase()}`)).toBe(hex);
+  });
+
+  it('trims surrounding whitespace', () => {
+    expect(normalizeChecksum(`  SHA256:${hex}\n`)).toBe(hex);
+  });
+
+  it('rejects values that are not a SHA-256 hex digest', () => {
+    expect(() => normalizeChecksum('sha256:dummy')).toThrow('Invalid checksum');
+    expect(() => normalizeChecksum(`sha256:${hex}00`)).toThrow('Invalid checksum');
+    expect(() => normalizeChecksum('md5:d41d8cd98f00b204e9800998ecf8427e')).toThrow(
+      'Invalid checksum'
+    );
+  });
+});
+
+describe('PluginManager archive-checksum formats', () => {
+  const pluginURL = 'https://artifacthub.io/packages/headlamp/test-repo/headlamp_minikube';
+
+  it.each([
+    ['uppercase hex', (hex: string) => `SHA256:${hex.toUpperCase()}`],
+    ['a mixed-case prefix', (hex: string) => `Sha256:${hex}`],
+    ['a trailing newline', (hex: string) => `SHA256:${hex}\n`],
+  ])(
+    'installs a plugin whose checksum uses %s',
+    async (_label, formatChecksum) => {
+      const testDataDir = getUniqueTestDir(TEST_DATA_BASE_DIR, 'checksum-format-data');
+      const pluginDestDir = getUniqueTestDir(PLUGIN_DEST_BASE_DIR, 'checksum-format-plugins');
+      try {
+        await createMinimalPluginTarball(testDataDir);
+        mockArtifactHubAPIWithoutPlatformSpecific(testDataDir, formatChecksum);
+
+        await PluginManager.install(pluginURL, pluginDestDir, HEADLAMP_VERSION, null, null);
+
+        expect(fs.existsSync(path.join(pluginDestDir, 'headlamp_minikube', 'main.js'))).toBe(true);
+      } finally {
+        fs.rmSync(pluginDestDir, { recursive: true, force: true });
+        fs.rmSync(testDataDir, { recursive: true, force: true });
+      }
+    },
+    30000
+  );
+
+  it('still rejects a checksum that does not match the archive', async () => {
+    const testDataDir = getUniqueTestDir(TEST_DATA_BASE_DIR, 'checksum-mismatch-data');
+    const pluginDestDir = getUniqueTestDir(PLUGIN_DEST_BASE_DIR, 'checksum-mismatch-plugins');
+    try {
+      await createMinimalPluginTarball(testDataDir);
+      mockArtifactHubAPIWithoutPlatformSpecific(testDataDir, () => `SHA256:${'0'.repeat(64)}`);
+
+      await expect(
+        PluginManager.install(pluginURL, pluginDestDir, HEADLAMP_VERSION, null, null)
+      ).rejects.toThrow('Checksum mismatch.');
+      expect(fs.existsSync(path.join(pluginDestDir, 'headlamp_minikube'))).toBe(false);
+    } finally {
+      fs.rmSync(pluginDestDir, { recursive: true, force: true });
+      fs.rmSync(testDataDir, { recursive: true, force: true });
+    }
+  }, 30000);
+});
+
 describe('getExtraFiles', () => {
+  it.each(['nested/../../outside', 'nested\\..\\..\\outside', '/outside', 'C:\\outside'])(
+    'rejects an extra-file path that escapes the bin directory: %s',
+    candidate => {
+      expect(() => resolveExtraFilePath('/plugins/example/bin', candidate, 'output')).toThrow(
+        'Invalid extra file output path'
+      );
+    }
+  );
+
   it('should extract extra-files with valid github.com/kubernetes/minikube URL', () => {
     const annotations = {
       'headlamp/plugin/extra-files/0/url':
@@ -600,6 +1098,35 @@ describe('getExtraFiles', () => {
         'https://github.com/kubernetes/minikube/releases/download/v1.0.0/minikube-linux-amd64.tar.gz',
     };
     expect(getExtraFiles(annotations)).toBeUndefined();
+  });
+
+  it('ignores prototype-pollution annotation keys without mutating Object.prototype', () => {
+    const annotations = JSON.parse(
+      JSON.stringify({
+        '__proto__/pollutedFromProto': 'yes',
+        'constructor/prototype/pollutedFromCtor': 'yes',
+        'headlamp/plugin/extra-files/__proto__/pollutedNested': 'yes',
+        'headlamp/plugin/extra-files/0/url':
+          'https://github.com/kubernetes/minikube/releases/download/v1.0.0/minikube-linux-amd64.tar.gz',
+        'headlamp/plugin/extra-files/0/checksum': 'sha256:abc123',
+        'headlamp/plugin/extra-files/0/arch': 'linux/x64',
+        'headlamp/plugin/extra-files/0/output/minikube/output': 'minikube',
+        'headlamp/plugin/extra-files/0/output/minikube/input': 'minikube-linux-amd64',
+      })
+    ) as Record<string, string>;
+
+    try {
+      const extraFiles = getExtraFiles(annotations);
+      expect(extraFiles).toBeDefined();
+      expect(Object.values(extraFiles!)).toHaveLength(1);
+      expect(({} as Record<string, unknown>).pollutedFromProto).toBeUndefined();
+      expect(({} as Record<string, unknown>).pollutedFromCtor).toBeUndefined();
+      expect(({} as Record<string, unknown>).pollutedNested).toBeUndefined();
+    } finally {
+      delete (Object.prototype as Record<string, unknown>).pollutedFromProto;
+      delete (Object.prototype as Record<string, unknown>).pollutedFromCtor;
+      delete (Object.prototype as Record<string, unknown>).pollutedNested;
+    }
   });
 });
 
@@ -750,4 +1277,69 @@ describe('TLS error detection', () => {
       }
     }
   }, 30000);
+});
+
+describe('isPathWithinDirectory', () => {
+  const baseDir = path.join(os.tmpdir(), 'headlamp-plugins-test-base');
+
+  it('allows a normal plugin folder name', () => {
+    const target = path.join(baseDir, 'headlamp-my-plugin');
+    expect(isPathWithinDirectory(baseDir, target)).toBe(true);
+  });
+
+  it('allows a nested subdirectory', () => {
+    const target = path.join(baseDir, 'sub', 'plugin');
+    expect(isPathWithinDirectory(baseDir, target)).toBe(true);
+  });
+
+  it('allows a folder name that starts with ..', () => {
+    const target = path.join(baseDir, '..foo');
+    expect(isPathWithinDirectory(baseDir, target)).toBe(true);
+  });
+
+  it('rejects a folder name that traverses outside the base directory', () => {
+    const target = path.join(baseDir, '..', '..', '..', 'etc');
+    expect(isPathWithinDirectory(baseDir, target)).toBe(false);
+  });
+
+  it('rejects the base directory itself', () => {
+    expect(isPathWithinDirectory(baseDir, baseDir)).toBe(false);
+  });
+
+  it('rejects an unrelated absolute path', () => {
+    expect(isPathWithinDirectory(baseDir, '/etc/passwd')).toBe(false);
+  });
+});
+
+// The IPC contract only reveals plugin directories, so containment alone is not
+// enough: a renderer-supplied name can still resolve to an in-tree file.
+describe('isExistingDirectory', () => {
+  const baseDir = getUniqueTestDir(TEST_DATA_BASE_DIR, 'is-existing-directory');
+
+  afterEach(() => {
+    if (fs.existsSync(baseDir)) {
+      fs.rmSync(baseDir, { recursive: true });
+    }
+  });
+
+  it('accepts a directory', () => {
+    const pluginDir = path.join(baseDir, 'headlamp-my-plugin');
+    fs.mkdirSync(pluginDir, { recursive: true });
+
+    expect(isExistingDirectory(pluginDir)).toBe(true);
+  });
+
+  it('rejects a file', () => {
+    const binDir = path.join(baseDir, 'headlamp-my-plugin', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+
+    const binary = path.join(binDir, 'tool');
+    fs.writeFileSync(binary, 'binary');
+
+    expect(isExistingDirectory(binary)).toBe(false);
+  });
+
+  it('rejects a path that does not exist', () => {
+    expect(isExistingDirectory(path.join(baseDir, 'missing'))).toBe(false);
+  });
 });

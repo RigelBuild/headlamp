@@ -119,7 +119,7 @@
               class="MuiBox-root css-1txv3mw"
             >
               <div
-                class="MuiBox-root css-0"
+                class="MuiBox-root css-h5fkc8"
               >
                 <dl
                   class="MuiGrid-root MuiGrid-container css-kxuems-MuiGrid-root"
@@ -192,7 +192,7 @@
                   >
                     <p
                       aria-label="My description"
-                      class="MuiTypography-root MuiTypography-body1 css-1d0cpfm-MuiTypography-root"
+                      class="MuiTypography-root MuiTypography-body1 css-1t59wre-MuiTypography-root"
                       data-mui-internal-clone-element="true"
                     >
                       mycustomresource

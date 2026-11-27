@@ -15,15 +15,21 @@
  */
 
 import fs from 'fs';
+import { fileURLToPath } from 'node:url';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import sharedConfig from './i18nextSharedConfig.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const directoryPath = path.join(__dirname, sharedConfig.localesPath);
 const currentLocales = [];
 
-fs.readdirSync(directoryPath).forEach(file => currentLocales.push(file));
+fs.readdirSync(directoryPath).forEach(file => {
+  // The region-less pt catalog is retained for older checkouts but is not a
+  // supported locale: legacy pt preferences resolve to pt-PT.
+  if (file !== 'pt') {
+    currentLocales.push(file);
+  }
+});
 
 export default {
   lexers: {

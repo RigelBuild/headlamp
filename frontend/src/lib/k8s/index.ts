@@ -23,101 +23,12 @@ import { getCluster } from '../cluster';
 import { clusterRequest } from './api/v1/clusterRequests';
 import { ApiError } from './api/v2/ApiError';
 import { Cluster, LabelSelector, StringDict } from './cluster';
-import ClusterRole from './clusterRole';
-import ClusterRoleBinding from './clusterRoleBinding';
-import ConfigMap from './configMap';
-import ControllerRevision from './controllerRevision';
-import CustomResourceDefinition from './crd';
-import CronJob from './cronJob';
-import DaemonSet from './daemonSet';
-import Deployment from './deployment';
-import Endpoints from './endpoints';
-import EndpointSlice from './endpointSlices';
-import Gateway from './gateway';
-import GatewayClass from './gatewayClass';
-import GRPCRoute from './grpcRoute';
-import HPA from './hpa';
-import HTTPRoute from './httpRoute';
-import Ingress from './ingress';
-import IngressClass from './ingressClass';
-import Job from './job';
-import JobSet from './jobSet';
-import LeaderWorkerSet from './leaderWorkerSet';
-import { Lease } from './lease';
-import { LimitRange } from './limitRange';
-import Namespace from './namespace';
-import NetworkPolicy from './networkpolicy';
-import Node from './node';
-import PersistentVolume from './persistentVolume';
-import PersistentVolumeClaim from './persistentVolumeClaim';
-import Pod from './pod';
-import PodDisruptionBudget from './podDisruptionBudget';
-import PodGroup from './podGroup';
-import PriorityClass from './priorityClass';
-import ReplicaSet from './replicaSet';
-import ResourceQuota from './resourceQuota';
-import Role from './role';
-import RoleBinding from './roleBinding';
-import { RuntimeClass } from './runtime';
-import SchedulingWorkload from './schedulingWorkload';
-import Secret from './secret';
-import Service from './service';
-import ServiceAccount from './serviceAccount';
-import StatefulSet from './statefulSet';
-import StorageClass from './storageClass';
-import TCPRoute from './tcpRoute';
-import UDPRoute from './udpRoute';
-import VolumeAttributesClass from './volumeAttributesClass';
+export { ResourceClasses } from './resourceClasses';
+import { matchExpressionSimplifier, matchLabelsSimplifier } from './labelSelector';
 
-export const ResourceClasses = {
-  ClusterRole,
-  ClusterRoleBinding,
-  ConfigMap,
-  ControllerRevision,
-  CustomResourceDefinition,
-  CronJob,
-  DaemonSet,
-  Deployment,
-  Endpoint: Endpoints,
-  Endpoints,
-  EndpointSlice,
-  LimitRange,
-  Lease,
-  ResourceQuota,
-  HorizontalPodAutoscaler: HPA,
-  PodDisruptionBudget,
-  PodGroup,
-  PriorityClass,
-  Ingress,
-  IngressClass,
-  Job,
-  JobSet,
-  LeaderWorkerSet,
-  Namespace,
-  NetworkPolicy,
-  Node,
-  PersistentVolume,
-  PersistentVolumeClaim,
-  Pod,
-  ReplicaSet,
-  Role,
-  RoleBinding,
-  RuntimeClass,
-  Secret,
-  Service,
-  ServiceAccount,
-  StatefulSet,
-  StorageClass,
-  VolumeAttributesClass,
-  Gateway,
-  GatewayClass,
-  HTTPRoute,
-  GRPCRoute,
-  TCPRoute,
-  UDPRoute,
-  // Keyed by kind, so the scheduling.k8s.io Workload is registered as 'Workload'.
-  Workload: SchedulingWorkload,
-};
+// Defined in a leaf module so resource classes can use them without importing
+// this file, which re-exports ResourceClasses and would create a cycle.
+export { matchExpressionSimplifier, matchLabelsSimplifier };
 
 /** Hook for getting or fetching the clusters configuration.
  * This gets the clusters from the redux store. The redux store is updated
@@ -128,20 +39,16 @@ export const ResourceClasses = {
  * */
 export function useClustersConf(): ConfigState['allClusters'] {
   const state = useTypedSelector(state => state.config);
-  const clusters = _.cloneDeep(state.clusters || {});
-  const allClusters = _.cloneDeep(state.allClusters || {});
-  Object.assign(allClusters, clusters);
-
-  if (state.statelessClusters) {
-    // Combine statelessClusters with clusters
-    const statelessClusters = _.cloneDeep(state.statelessClusters || {});
-    Object.assign(allClusters, statelessClusters);
-  }
-
   return useMemo(
-    () => (state.clusters === null ? null : allClusters),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [state.clusters === null, Object.keys(allClusters).join(',')]
+    () =>
+      state.clusters === null
+        ? null
+        : _.cloneDeep({
+            ...state.allClusters,
+            ...state.clusters,
+            ...state.statelessClusters,
+          }),
+    [state.clusters, state.allClusters, state.statelessClusters]
   );
 }
 
@@ -177,111 +84,6 @@ export function labelSelectorToQuery(labelSelector: LabelSelector) {
   }
 
   return segments.join(',');
-}
-
-/**
- * Simplifies a matchLabels object into an array of string expressions.
- *
- * @param matchLabels - the matchLabels object from a LabelSelector.
- * @param isEqualSeperator - whether to use "=" as the separator instead of ":".
- * @returns an array of simplified label strings, or an empty string.
- */
-export function matchLabelsSimplifier(
-  matchLabels: LabelSelector['matchLabels'],
-  isEqualSeperator = false
-): string[] | '' {
-  if (!matchLabels) {
-    return '';
-  }
-
-  const segments: string[] = [];
-  for (const k in matchLabels) {
-    if (isEqualSeperator) {
-      segments.push(`${k}=${matchLabels[k]}`);
-      continue;
-    }
-    segments.push(`${k}: ${matchLabels[k]}`);
-  }
-
-  return segments;
-}
-
-/**
- * Simplifies a matchExpressions array into an array of string representations.
- *
- * @param matchExpressions - the matchExpressionss array from a LabelSelector.
- * @returns an array of simplified expression strings, or an empty string.
- */
-export function matchExpressionSimplifier(
-  matchExpressions: LabelSelector['matchExpressions']
-): string[] | '' {
-  if (!matchExpressions) {
-    return '';
-  }
-
-  const segments: string[] = [];
-  for (const expr of matchExpressions) {
-    let segment = '';
-    if (expr.operator === 'DoesNotExist') {
-      segment += '!';
-    }
-
-    let needsParensWrap = false;
-    const NoLengthLimits = -1;
-    let expectedValuesLength = NoLengthLimits;
-
-    segment += expr.key;
-    switch (expr.operator) {
-      case 'Equals':
-        segment += '=';
-        expectedValuesLength = 1;
-        break;
-      case 'DoubleEquals':
-        segment += '==';
-        expectedValuesLength = 1;
-        break;
-      case 'NotEquals':
-        segment += '!=';
-        expectedValuesLength = 1;
-        break;
-      case 'In':
-        segment += ' in ';
-        needsParensWrap = true;
-        break;
-      case 'NotIn':
-        segment += ' notin ';
-        needsParensWrap = true;
-        break;
-      case 'GreaterThan':
-        segment += '>';
-        expectedValuesLength = 1;
-        break;
-      case 'LessThan':
-        segment += '<';
-        expectedValuesLength = 1;
-        break;
-      case 'Exists':
-      case 'DoesNotExist':
-        expectedValuesLength = 0;
-        break;
-    }
-
-    let values = '';
-
-    if (expectedValuesLength === 1) {
-      values = expr.values[0] ?? '';
-    } else if (expectedValuesLength === NoLengthLimits) {
-      values = [...(expr.values ?? [])].sort().join(',');
-      if (needsParensWrap) {
-        values = '(' + values + ')';
-      }
-    }
-
-    segment += values;
-    segments.push(segment);
-  }
-
-  return segments;
 }
 
 const versionFetchInterval = 10000; // ms
@@ -351,6 +153,8 @@ export function useClustersVersion(clusters: Cluster[]) {
 
 // Other exports that can be used by plugins:
 export * as cluster from './cluster';
+export * as certificateSigningRequest from './certificateSigningRequest';
+export * as clusterTrustBundle from './clusterTrustBundle';
 export * as clusterRole from './clusterRole';
 export * as clusterRoleBinding from './clusterRoleBinding';
 export * as configMap from './configMap';
@@ -359,6 +163,7 @@ export * as cronJob from './cronJob';
 export * as controllerRevision from './controllerRevision';
 export * as daemonSet from './daemonSet';
 export * as deployment from './deployment';
+export * as deviceClass from './deviceClass';
 export * as event from './event';
 export * as ingress from './ingress';
 export * as ingressClass from './ingressClass';
@@ -370,7 +175,11 @@ export * as node from './node';
 export * as persistentVolume from './persistentVolume';
 export * as persistentVolumeClaim from './persistentVolumeClaim';
 export * as pod from './pod';
+export * as compositePodGroup from './compositePodGroup';
 export * as podGroup from './podGroup';
+export * as resourceClaim from './resourceClaim';
+export * as resourceClaimTemplate from './resourceClaimTemplate';
+export * as resourceSlice from './resourceSlice';
 export * as schedulingWorkload from './schedulingWorkload';
 export * as replicaSet from './replicaSet';
 export * as role from './role';

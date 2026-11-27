@@ -16,7 +16,6 @@
 
 import React from 'react';
 import { useHistory } from 'react-router';
-import NotFoundComponent from '../../components/404';
 import AuthToken from '../../components/account/Auth';
 import AddCluster from '../../components/App/CreateCluster/AddCluster';
 import Home from '../../components/App/Home';
@@ -27,8 +26,14 @@ import Settings from '../../components/App/Settings';
 import SettingsCluster from '../../components/App/Settings/SettingsCluster';
 import SettingsClusters from '../../components/App/Settings/SettingsClusters';
 import AuthChooser from '../../components/authchooser';
+import CertificateSigningRequestDetails from '../../components/certificatesigningrequest/Details';
+import CertificateSigningRequestList from '../../components/certificatesigningrequest/List';
 import Overview from '../../components/cluster/Overview';
+import ClusterTrustBundleDetails from '../../components/clustertrustbundle/Details';
+import ClusterTrustBundleList from '../../components/clustertrustbundle/List';
 import { PageGrid } from '../../components/common/Resource/Resource';
+import CompositePodGroupDetails from '../../components/compositePodGroup/Details';
+import CompositePodGroupList from '../../components/compositePodGroup/List';
 import ConfigDetails from '../../components/configmap/Details';
 import ConfigMapList from '../../components/configmap/List';
 import CustomResourceDetails from '../../components/crd/CustomResourceDetails';
@@ -38,6 +43,14 @@ import CustomResourceDefinitionDetails from '../../components/crd/Details';
 import CustomResourceDefinitionList from '../../components/crd/List';
 import DaemonSetList from '../../components/daemonset/List';
 import DeploymentsList from '../../components/deployments/List';
+import DeviceClassDetails from '../../components/device/DeviceClassDetails';
+import DeviceClassList from '../../components/device/DeviceClassList';
+import ResourceClaimDetails from '../../components/device/ResourceClaimDetails';
+import ResourceClaimList from '../../components/device/ResourceClaimList';
+import ResourceClaimTemplateDetails from '../../components/device/ResourceClaimTemplateDetails';
+import ResourceClaimTemplateList from '../../components/device/ResourceClaimTemplateList';
+import ResourceSliceDetails from '../../components/device/ResourceSliceDetails';
+import ResourceSliceList from '../../components/device/ResourceSliceList';
 import EndpointDetails from '../../components/endpoints/Details';
 import EndpointList from '../../components/endpoints/List';
 import EndpointSliceDetails from '../../components/endpointSlices/Details';
@@ -74,6 +87,10 @@ import { LeaseDetails } from '../../components/lease/Details';
 import { LeaseList } from '../../components/lease/List';
 import { LimitRangeDetails } from '../../components/limitRange/Details';
 import { LimitRangeList } from '../../components/limitRange/List';
+import MutatingAdmissionPolicyDetails from '../../components/mutatingAdmissionPolicy/Details';
+import MutatingAdmissionPolicyList from '../../components/mutatingAdmissionPolicy/List';
+import MutatingAdmissionPolicyBindingDetails from '../../components/mutatingAdmissionPolicyBinding/Details';
+import MutatingAdmissionPolicyBindingList from '../../components/mutatingAdmissionPolicyBinding/List';
 import NamespaceDetails from '../../components/namespace/Details';
 import NamespacesList from '../../components/namespace/List';
 import { NetworkPolicyDetails } from '../../components/networkpolicy/Details';
@@ -107,7 +124,7 @@ import ServiceDetails from '../../components/service/Details';
 import ServiceList from '../../components/service/List';
 import ServiceAccountDetails from '../../components/serviceaccount/Details';
 import ServiceAccountList from '../../components/serviceaccount/List';
-import { DefaultSidebars } from '../../components/Sidebar';
+import { DefaultSidebars } from '../../components/Sidebar/sidebarSlice';
 import StatefulSetList from '../../components/statefulset/List';
 import PersistentVolumeClaimDetails from '../../components/storage/ClaimDetails';
 import PersistentVolumeClaimList from '../../components/storage/ClaimList';
@@ -654,6 +671,32 @@ const defaultRoutes: { [routeName: string]: Route } = {
     sidebar: 'serviceAccounts',
     component: () => <ServiceAccountDetails />,
   },
+  certificateSigningRequests: {
+    path: '/certificatesigningrequests',
+    exact: true,
+    name: 'Certificate Signing Requests',
+    sidebar: 'certificateSigningRequests',
+    component: () => <CertificateSigningRequestList />,
+  },
+  certificateSigningRequest: {
+    path: '/certificatesigningrequests/:name',
+    exact: true,
+    sidebar: 'certificateSigningRequests',
+    component: () => <CertificateSigningRequestDetails />,
+  },
+  clusterTrustBundles: {
+    path: '/clustertrustbundles',
+    exact: true,
+    name: 'Cluster Trust Bundles',
+    sidebar: 'clusterTrustBundles',
+    component: () => <ClusterTrustBundleList />,
+  },
+  clusterTrustBundle: {
+    path: '/clustertrustbundles/:name',
+    exact: true,
+    sidebar: 'clusterTrustBundles',
+    component: () => <ClusterTrustBundleDetails />,
+  },
   roles: {
     path: '/roles',
     exact: true,
@@ -674,8 +717,9 @@ const defaultRoutes: { [routeName: string]: Route } = {
     component: () => <RoleDetails />,
   },
   clusterRoles: {
-    path: '/roles',
+    path: '/clusterroles',
     exact: true,
+    name: 'Roles',
     sidebar: 'roles',
     component: () => <RoleList />,
   },
@@ -701,10 +745,10 @@ const defaultRoutes: { [routeName: string]: Route } = {
     component: () => <RoleBindingDetails />,
   },
   clusterRoleBindings: {
-    path: '/rolebindings',
+    path: '/clusterrolebindings',
     exact: true,
     sidebar: 'roleBindings',
-    component: () => <RoleBindingDetails />,
+    component: () => <RoleBindingList />,
   },
   secrets: {
     path: '/secrets',
@@ -761,6 +805,20 @@ const defaultRoutes: { [routeName: string]: Route } = {
     sidebar: 'podGroups',
     component: () => <PodGroupDetails />,
   },
+  compositepodgroups: {
+    path: '/compositepodgroups',
+    exact: true,
+    name: 'Composite Pod Groups',
+    sidebar: 'compositePodGroups',
+    component: () => <CompositePodGroupList />,
+  },
+  CompositePodGroup: {
+    path: '/compositepodgroups/:namespace/:name',
+    exact: true,
+    name: 'Composite Pod Group',
+    sidebar: 'compositePodGroups',
+    component: () => <CompositePodGroupDetails />,
+  },
   // The 'workloads' route name is taken by the Workloads overview page, so the
   // scheduling.k8s.io Workload uses 'schedulingWorkloads' as its list route.
   schedulingWorkloads: {
@@ -776,6 +834,62 @@ const defaultRoutes: { [routeName: string]: Route } = {
     name: 'Workload',
     sidebar: 'schedulingWorkloads',
     component: () => <SchedulingWorkloadDetails />,
+  },
+  deviceclasses: {
+    path: '/deviceclasses',
+    exact: true,
+    name: 'Device Classes',
+    sidebar: 'deviceClasses',
+    component: () => <DeviceClassList />,
+  },
+  deviceClass: {
+    path: '/deviceclasses/:name',
+    exact: true,
+    name: 'Device Class',
+    sidebar: 'deviceClasses',
+    component: () => <DeviceClassDetails />,
+  },
+  resourceclaims: {
+    path: '/resourceclaims',
+    exact: true,
+    name: 'Resource Claims',
+    sidebar: 'resourceClaims',
+    component: () => <ResourceClaimList />,
+  },
+  resourceClaim: {
+    path: '/resourceclaims/:namespace/:name',
+    exact: true,
+    name: 'Resource Claim',
+    sidebar: 'resourceClaims',
+    component: () => <ResourceClaimDetails />,
+  },
+  resourceclaimtemplates: {
+    path: '/resourceclaimtemplates',
+    exact: true,
+    name: 'Resource Claim Templates',
+    sidebar: 'resourceClaimTemplates',
+    component: () => <ResourceClaimTemplateList />,
+  },
+  resourceClaimTemplate: {
+    path: '/resourceclaimtemplates/:namespace/:name',
+    exact: true,
+    name: 'Resource Claim Template',
+    sidebar: 'resourceClaimTemplates',
+    component: () => <ResourceClaimTemplateDetails />,
+  },
+  resourceslices: {
+    path: '/resourceslices',
+    exact: true,
+    name: 'Resource Slices',
+    sidebar: 'resourceSlices',
+    component: () => <ResourceSliceList />,
+  },
+  resourceSlice: {
+    path: '/resourceslices/:name',
+    exact: true,
+    name: 'Resource Slice',
+    sidebar: 'resourceSlices',
+    component: () => <ResourceSliceDetails />,
   },
   priorityclasses: {
     path: '/priorityclasses',
@@ -861,6 +975,34 @@ const defaultRoutes: { [routeName: string]: Route } = {
     sidebar: 'mutatingWebhookConfigurations',
     component: () => <MutatingWebhookConfigurationDetails />,
   },
+  mutatingAdmissionPolicies: {
+    path: '/mutatingadmissionpolicies',
+    exact: true,
+    name: 'Mutating Admission Policies',
+    sidebar: 'mutatingAdmissionPolicies',
+    component: () => <MutatingAdmissionPolicyList />,
+  },
+  mutatingAdmissionPolicy: {
+    path: '/mutatingadmissionpolicies/:name',
+    exact: true,
+    name: 'Mutating Admission Policy',
+    sidebar: 'mutatingAdmissionPolicies',
+    component: () => <MutatingAdmissionPolicyDetails />,
+  },
+  mutatingAdmissionPolicyBindings: {
+    path: '/mutatingadmissionpolicybindings',
+    exact: true,
+    name: 'Mutating Admission Policy Bindings',
+    sidebar: 'mutatingAdmissionPolicyBindings',
+    component: () => <MutatingAdmissionPolicyBindingList />,
+  },
+  mutatingAdmissionPolicyBinding: {
+    path: '/mutatingadmissionpolicybindings/:name',
+    exact: true,
+    name: 'Mutating Admission Policy Binding',
+    sidebar: 'mutatingAdmissionPolicyBindings',
+    component: () => <MutatingAdmissionPolicyBindingDetails />,
+  },
   validatingWebhookConfigurations: {
     path: '/validatingwebhookconfigurations',
     exact: true,
@@ -901,6 +1043,7 @@ const defaultRoutes: { [routeName: string]: Route } = {
     path: '/auth',
     name: 'OidcAuth',
     sidebar: null,
+    useClusterURL: false,
     noAuthRequired: true,
     component: () => <OIDCAuth />,
   },
@@ -909,6 +1052,19 @@ const defaultRoutes: { [routeName: string]: Route } = {
     exact: true,
     name: 'Login',
     sidebar: null,
+    noAuthRequired: true,
+    component: () => (
+      <AuthChooser>
+        <LocaleSelect />
+      </AuthChooser>
+    ),
+  },
+  encodedClusterLogin: {
+    path: '/encoded-clusters/:encodedCluster/login',
+    exact: true,
+    name: 'Login',
+    sidebar: null,
+    useClusterURL: false,
     noAuthRequired: true,
     component: () => (
       <AuthChooser>
@@ -1092,14 +1248,4 @@ const defaultRoutes: { [routeName: string]: Route } = {
 
 setDefaultRoutes(defaultRoutes);
 
-// The NotFound route  needs to be considered always in the last place when used
-// with the router switch, as any routes added after this one will never be considered.
-// So we do not include it in the default routes in order to always "manually" consider it.
-export const NotFoundRoute = {
-  path: '*',
-  exact: true,
-  name: `Whoops! This page doesn't exist`,
-  component: () => <NotFoundComponent />,
-  sidebar: null,
-  noAuthRequired: true,
-};
+export { NotFoundRoute } from './notFoundRoute';

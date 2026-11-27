@@ -1,4 +1,19 @@
 #!/bin/sh
+
+# Copyright 2025 The Kubernetes Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # A humble test of the plugins/examples
 
 set -e
@@ -37,9 +52,11 @@ for dir in */; do
   names="${names:+$names,}$dir"
   # `npm ci` from the lockfile, then overlay the locally built tarball so we
   # test repo changes the published version may not have. `npm ci` can't do
-  # the overlay itself (it ignores positional package args); `--no-save
-  # --no-package-lock` keeps the example's package.json / lockfile clean.
-  set -- "$@" "cd '$dir' && npm ci && npm install --no-save --no-package-lock \"\$TARBALL\" && npm run lint && npm run format && npm run build && npm run tsc"
+  # the overlay itself (it ignores positional package args); `--no-save`
+  # keeps the local tarball out of the example's dependency declarations.
+  # Keep package-lock enabled so npm does not re-resolve pinned transitive
+  # dependencies while installing the tarball.
+  set -- "$@" "cd '$dir' && npm ci && npm install --no-save \"\$TARBALL\" && npm run lint && npm run format && npm run build && npm run tsc"
 done
 
 [ -n "$names" ] || { echo "Error: no example directories found in $(pwd)" >&2; exit 1; }

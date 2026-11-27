@@ -29,7 +29,7 @@ import {
   useTheme,
 } from '@mui/material';
 import { uniq } from 'lodash';
-import { ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
+import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
 import { useHistory } from 'react-router';
 import { useClustersConf } from '../../lib/k8s';
@@ -40,7 +40,93 @@ import Namespace from '../../lib/k8s/namespace';
 import { createRouteURL } from '../../lib/router/createRouteURL';
 import { EventStatus, HeadlampEventType, useEventCallback } from '../../redux/headlampEventSlice';
 import { useTypedSelector } from '../../redux/hooks';
+import { DefaultCreateProject } from '../../redux/projectsSlice';
 import { PROJECT_ID_LABEL, toKubernetesName } from './projectUtils';
+
+const EMPTY_NAMESPACES: Namespace[] = [];
+
+/** Identifies a namespace labelled for a project, as the create dialog writes it. */
+function projectWriteKey(projectId: string, cluster: string, namespace: string) {
+  return `${projectId}/${cluster}/${namespace}`;
+}
+
+/**
+ * Keeps track of the namespaces the create dialog labels for the project being defined.
+ *
+ * The watched namespace list picks up those labels, so validating against it would report the
+ * project being created as an existing one. `otherNamespaces` leaves the dialog's own writes
+ * for the current project and namespace out. Any other row still counts: the same namespace
+ * labelled for another project, this project's rows when a different name or namespace is
+ * entered, or a cluster this dialog did not write to. A row is the dialog's own only while it
+ * carries the exact label the dialog wrote, so a namespace someone moves to another project
+ * counts again, even when both labels normalise to the same name.
+ */
+function useOwnProjectWrites(
+  projectId: string,
+  namespace: string,
+  clusters: string[],
+  namespaces: Namespace[] | null | undefined
+) {
+  // Label written per key (see projectWriteKey) once the API server confirmed the write, in
+  // this or an earlier attempt
+  const [acknowledged, setAcknowledged] = useState(() => new Map<string, string>());
+  // Label being written per key in the attempt in progress, hidden before the watch reports
+  // the rows back
+  const [inFlight, setInFlight] = useState(() => new Map<string, string>());
+  // Definitions (project, namespace and clusters) already announced with a CREATE_PROJECT event
+  const announced = useRef(new Set<string>());
+
+  const keys = useMemo(
+    () => clusters.map(cluster => projectWriteKey(projectId, cluster, namespace)),
+    [projectId, namespace, clusters]
+  );
+  const definition = `${projectId}/${namespace}/${[...clusters].sort().join(',')}`;
+
+  const otherNamespaces = useMemo(() => {
+    if (!namespaces) return EMPTY_NAMESPACES;
+    if (acknowledged.size === 0 && inFlight.size === 0) return namespaces;
+    return namespaces.filter(ns => {
+      const label = ns.metadata.labels?.[PROJECT_ID_LABEL];
+      if (!label || ns.metadata.name !== namespace) {
+        return true;
+      }
+      const key = projectWriteKey(projectId, ns.cluster, ns.metadata.name);
+      return acknowledged.get(key) !== label && inFlight.get(key) !== label;
+    });
+  }, [namespaces, acknowledged, inFlight, projectId, namespace]);
+
+  /** Starts an attempt to write the current definition, labelling the namespaces with `label` */
+  const begin = (label: string) => {
+    // A retry of a creation that failed half way is not a new project, but a changed
+    // definition (e.g. a different set of clusters) is announced again
+    const isNewDefinition = !announced.current.has(definition);
+    announced.current.add(definition);
+    setInFlight(new Map(keys.map(key => [key, label])));
+
+    return {
+      isNewDefinition,
+      /** Records that the namespace is labelled in the cluster */
+      markWritten: (cluster: string) => {
+        const key = projectWriteKey(projectId, cluster, namespace);
+        setAcknowledged(prev => (prev.get(key) === label ? prev : new Map(prev).set(key, label)));
+      },
+      /** Ends the attempt: rows in clusters that were never written are not ours */
+      end: () => setInFlight(new Map()),
+    };
+  };
+
+  return { otherNamespaces, begin };
+}
+
+/**
+ * The namespace name for what the user picked or typed. A valid name is used as it is: it may
+ * be an existing namespace, and toKubernetesName changes some valid names (`team--dev` becomes
+ * `team-dev`, a different namespace). Anything else is turned into a valid name.
+ */
+function toNamespaceName(text: string) {
+  return Namespace.isValidNamespaceFormat(text) ? text : toKubernetesName(text);
+}
+
 /**
  * A styled button for selecting a project type.
  */
@@ -121,36 +207,44 @@ function ProjectFromExistingNamespace({ onBack }: { onBack: () => void }) {
     clusters: selectedClusters,
   });
 
+  const projectId = toKubernetesName(projectName);
+  const effectiveNamespace = selectedNamespace || toNamespaceName(typedNamespace);
+  const { otherNamespaces, begin: beginWrites } = useOwnProjectWrites(
+    projectId,
+    effectiveNamespace,
+    selectedClusters,
+    namespaces
+  );
+
   const existingProjectNames = useMemo(() => {
-    if (!namespaces) return new Set<string>();
     const result = new Set<string>();
-    for (const ns of namespaces) {
+    for (const ns of otherNamespaces) {
       const labelValue = ns.metadata.labels?.[PROJECT_ID_LABEL];
       if (!labelValue) {
         continue;
       }
       result.add(labelValue);
-      result.add(toKubernetesName(labelValue));
+      const normalized = toKubernetesName(labelValue);
+      if (normalized) {
+        result.add(normalized);
+      }
     }
     return result;
-  }, [namespaces]);
+  }, [otherNamespaces]);
 
   // Check if project name already exists (using normalized form to match existing entries)
-  const projectNameExists =
-    projectName.length > 0 && existingProjectNames.has(toKubernetesName(projectName));
+  const projectNameExists = projectName.length > 0 && existingProjectNames.has(projectId);
   const namespaceToProjectMap = useMemo(() => {
     const map = new Map<string, string>();
-    if (!namespaces) return map;
-    namespaces.forEach(ns => {
+    otherNamespaces.forEach(ns => {
       const projectId = ns.metadata?.labels?.[PROJECT_ID_LABEL];
       if (projectId) {
         map.set(ns.metadata.name, projectId);
       }
     });
     return map;
-  }, [namespaces]);
+  }, [otherNamespaces]);
 
-  const effectiveNamespace = selectedNamespace || toKubernetesName(typedNamespace);
   const isNamespaceAlreadyAssigned = effectiveNamespace
     ? namespaceToProjectMap.has(effectiveNamespace)
     : false;
@@ -159,6 +253,8 @@ function ProjectFromExistingNamespace({ onBack }: { onBack: () => void }) {
     selectedClusters.length &&
     (selectedNamespace || typedNamespace) &&
     projectName &&
+    projectId !== '' &&
+    effectiveNamespace !== '' &&
     !projectNameExists &&
     !isNamespaceAlreadyAssigned;
 
@@ -174,56 +270,77 @@ function ProjectFromExistingNamespace({ onBack }: { onBack: () => void }) {
   const handleCreate = async () => {
     if (!isReadyToCreate || isCreating) return;
 
-    dispatchCreateProjectEvent({
-      project: {
-        id: projectName,
-        namespaces: effectiveNamespace ? [effectiveNamespace] : [],
-        clusters: selectedClusters,
-      },
-      status: EventStatus.CONFIRMED,
-    });
+    const attempt = beginWrites(projectName);
+    if (attempt.isNewDefinition) {
+      dispatchCreateProjectEvent({
+        project: {
+          id: projectName,
+          namespaces: effectiveNamespace ? [effectiveNamespace] : [],
+          clusters: selectedClusters,
+        },
+        status: EventStatus.CONFIRMED,
+      });
+    }
 
     setIsCreating(true);
+    setError(undefined);
     try {
-      const existingNamespaces = namespaces?.filter(it => it.metadata.name === selectedNamespace);
-      const clustersWithExistingNamespace = existingNamespaces?.map(it => it.cluster) ?? [];
-      if (existingNamespaces && existingNamespaces.length > 0) {
-        // Update all existing namespaces with the same name across selected clusters
-        await Promise.all(
-          existingNamespaces.map(namespace =>
-            namespace.patch({
-              metadata: {
-                labels: {
-                  [PROJECT_ID_LABEL]: projectName,
-                },
-              },
-            })
-          )
-        );
-      }
-
+      const existingNamespaces =
+        namespaces?.filter(it => it.metadata.name === effectiveNamespace) ?? [];
+      const clustersWithExistingNamespace = existingNamespaces.map(it => it.cluster);
       // Create new namespace in all selected clusters that don't already have it
       const clustersWithoutNamespace = selectedClusters.filter(
         it => !clustersWithExistingNamespace.includes(it)
       );
+      // Namespaces that already carry the label, e.g. from an earlier attempt, are done
+      const namespacesToPatch: Namespace[] = [];
+      for (const it of existingNamespaces) {
+        if (it.metadata.labels?.[PROJECT_ID_LABEL] === projectName) {
+          attempt.markWritten(it.cluster);
+        } else {
+          namespacesToPatch.push(it);
+        }
+      }
+
+      if (namespacesToPatch.length > 0) {
+        // Update all existing namespaces with the same name across selected clusters
+        const results = await Promise.allSettled(
+          namespacesToPatch.map(namespace =>
+            namespace
+              .patch({
+                metadata: {
+                  labels: {
+                    [PROJECT_ID_LABEL]: projectName,
+                  },
+                },
+              })
+              .then(() => attempt.markWritten(namespace.cluster))
+          )
+        );
+        const failed = results.find(it => it.status === 'rejected');
+        if (failed) throw failed.reason;
+      }
+
       for (const cluster of clustersWithoutNamespace) {
         const namespace = {
           kind: 'Namespace',
           apiVersion: 'v1',
           metadata: {
-            name: toKubernetesName(typedNamespace),
+            name: effectiveNamespace,
             labels: {
               [PROJECT_ID_LABEL]: projectName,
             },
           } as any,
         } as KubeObjectInterface;
         await apply(namespace, cluster);
+        attempt.markWritten(cluster);
       }
 
       history.push(createRouteURL('projectDetails', { name: projectName }));
     } catch (e: any) {
       setError(e);
     } finally {
+      attempt.end();
       setIsCreating(false);
     }
   };
@@ -286,6 +403,7 @@ function ProjectFromExistingNamespace({ onBack }: { onBack: () => void }) {
           }
           autoComplete="off"
           fullWidth
+          disabled={isCreating}
         />
         <Autocomplete
           fullWidth
@@ -305,7 +423,7 @@ function ProjectFromExistingNamespace({ onBack }: { onBack: () => void }) {
             />
           )}
           noOptionsText={t('No available clusters')}
-          disabled={clusters.length === 0}
+          disabled={clusters.length === 0 || isCreating}
         />
         <Autocomplete
           fullWidth
@@ -313,12 +431,19 @@ function ProjectFromExistingNamespace({ onBack }: { onBack: () => void }) {
           options={uniq(namespaces?.map(it => it.metadata.name)) ?? []}
           value={selectedNamespace}
           onChange={(event, newValue) => {
-            setSelectedNamespace(newValue ?? undefined);
+            // Free text confirmed with Enter arrives as typed: keep a valid name as it is and
+            // normalise the rest, so the selection is what gets created
+            setSelectedNamespace(newValue ? toNamespaceName(newValue) || undefined : undefined);
           }}
-          onInputChange={(e, v) => {
+          onInputChange={(e, v, reason) => {
             setTypedNamespace(v);
+            // Typing over a picked option replaces it: what is created is what the user sees
+            if (reason !== 'reset' && v !== selectedNamespace) {
+              setSelectedNamespace(undefined);
+            }
           }}
           getOptionDisabled={option => namespaceToProjectMap.has(option)}
+          disabled={isCreating}
           renderInput={params => (
             <TextField
               {...params}
@@ -365,6 +490,15 @@ export function NewProjectPopup({ open, onClose }: { open: boolean; onClose: () 
   const customCreateProject = Object.values(
     useTypedSelector(state => state.projects.customCreateProject)
   );
+  const customNewProject = customCreateProject.find(
+    it => it.id === DefaultCreateProject.NEW_PROJECT
+  );
+  const customProjectFromYaml = customCreateProject.find(
+    it => it.id === DefaultCreateProject.FROM_YAML
+  );
+  const additionalCreateProjects = customCreateProject.filter(
+    it => it.id !== DefaultCreateProject.NEW_PROJECT && it.id !== DefaultCreateProject.FROM_YAML
+  );
 
   const [projectStep, setProjectStep] = useState<string | undefined>();
   const selectedCustomProject = customCreateProject.find(it => it.id === projectStep);
@@ -391,43 +525,84 @@ export function NewProjectPopup({ open, onClose }: { open: boolean; onClose: () 
               </Trans>
             </Typography>
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-              <ProjectTypeButton
-                index={index++}
-                icon={
-                  <Icon
-                    icon="mdi:folder-add"
-                    width="100%"
-                    height="100%"
-                    color={theme.palette.text.secondary}
-                  />
-                }
-                title={<Trans>New Project</Trans>}
-                description={<Trans>Create a new project</Trans>}
-                onClick={() => {
-                  setProjectStep('new-project');
-                }}
-              />
-
-              <ProjectTypeButton
-                index={index++}
-                icon={
-                  <Icon
-                    icon="mdi:file-document-add"
-                    width="100%"
-                    height="100%"
-                    color={theme.palette.text.secondary}
-                  />
-                }
-                title={<Trans>New Project from YAML</Trans>}
-                description={<Trans>Deploy a new application from YAML</Trans>}
-                onClick={() => {
-                  onClose();
-                  history.push(createRouteURL('projectCreateYaml'));
-                }}
-              />
-
-              {customCreateProject.map(it => (
+              {customNewProject ? (
                 <ProjectTypeButton
+                  index={index++}
+                  icon={
+                    typeof customNewProject.icon === 'string' ? (
+                      <Icon
+                        icon={customNewProject.icon}
+                        width="100%"
+                        height="100%"
+                        color={theme.palette.text.secondary}
+                      />
+                    ) : (
+                      <customNewProject.icon />
+                    )
+                  }
+                  title={customNewProject.name}
+                  description={customNewProject.description}
+                  onClick={() => setProjectStep(customNewProject.id)}
+                />
+              ) : (
+                <ProjectTypeButton
+                  index={index++}
+                  icon={
+                    <Icon
+                      icon="mdi:folder-add"
+                      width="100%"
+                      height="100%"
+                      color={theme.palette.text.secondary}
+                    />
+                  }
+                  title={<Trans>New Project</Trans>}
+                  description={<Trans>Create a new project</Trans>}
+                  onClick={() => setProjectStep(DefaultCreateProject.NEW_PROJECT)}
+                />
+              )}
+
+              {customProjectFromYaml ? (
+                <ProjectTypeButton
+                  index={index++}
+                  icon={
+                    typeof customProjectFromYaml.icon === 'string' ? (
+                      <Icon
+                        icon={customProjectFromYaml.icon}
+                        width="100%"
+                        height="100%"
+                        color={theme.palette.text.secondary}
+                      />
+                    ) : (
+                      <customProjectFromYaml.icon />
+                    )
+                  }
+                  title={customProjectFromYaml.name}
+                  description={customProjectFromYaml.description}
+                  onClick={() => setProjectStep(customProjectFromYaml.id)}
+                />
+              ) : (
+                <ProjectTypeButton
+                  index={index++}
+                  icon={
+                    <Icon
+                      icon="mdi:file-document-add"
+                      width="100%"
+                      height="100%"
+                      color={theme.palette.text.secondary}
+                    />
+                  }
+                  title={<Trans>New Project from YAML</Trans>}
+                  description={<Trans>Deploy a new application from YAML</Trans>}
+                  onClick={() => {
+                    onClose();
+                    history.push(createRouteURL('projectCreateYaml'));
+                  }}
+                />
+              )}
+
+              {additionalCreateProjects.map(it => (
+                <ProjectTypeButton
+                  key={it.id}
                   index={index++}
                   icon={
                     typeof it.icon === 'string' ? (
@@ -455,7 +630,9 @@ export function NewProjectPopup({ open, onClose }: { open: boolean; onClose: () 
           </DialogActions>
         </>
       )}
-      {projectStep === 'new-project' && <ProjectFromExistingNamespace onBack={handleBack} />}
+      {projectStep === DefaultCreateProject.NEW_PROJECT && !selectedCustomProject && (
+        <ProjectFromExistingNamespace onBack={handleBack} />
+      )}
       {selectedCustomProject && <selectedCustomProject.component onBack={handleBack} />}
     </Dialog>
   );

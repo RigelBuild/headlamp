@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package helm //nolint:testpackage
+package helm //nolint:testpackage // Tests cover unexported helm release handlers.
 
 import (
 	"context"
@@ -28,6 +28,7 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/logger"
 )
 
 // newTestCache returns an in-memory cache usable in tests.
@@ -175,6 +176,31 @@ func TestNewActionConfig(t *testing.T) {
 	assert.NotNil(t, cfg)
 }
 
+func TestNewActionConfigLogger(t *testing.T) {
+	var (
+		loggedMsg    string
+		loggedFields map[string]string
+	)
+
+	oldLogger := logger.SetLogFunc(func(level uint, fields map[string]string, err interface{}, msg string) {
+		loggedMsg = msg
+		loggedFields = fields
+	})
+	defer logger.SetLogFunc(oldLogger)
+
+	cfg, err := NewActionConfig(fakeClientConfig(), "test-namespace")
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+	require.NotNil(t, cfg.Log)
+
+	cfg.Log("release %s created with %d revisions", "my-app", 2)
+	assert.Equal(t, "release my-app created with 2 revisions", loggedMsg)
+	assert.Equal(t, "test-namespace", loggedFields["namespace"])
+
+	cfg.Log("clearing release cache")
+	assert.Equal(t, "clearing release cache", loggedMsg)
+}
+
 func TestSetReleaseStatusKeyIsolation(t *testing.T) {
 	h, err := NewHandler(newTestCache())
 	require.NoError(t, err)
@@ -207,6 +233,30 @@ func TestRestConfigGetterToDiscoveryClientBadConfig(t *testing.T) {
 	}
 	_, err := g.ToDiscoveryClient()
 	assert.Error(t, err)
+}
+
+func TestRestConfigGetterToDiscoveryClientInvalidCAData(t *testing.T) {
+	cfg := clientcmdapi.NewConfig()
+	cfg.Clusters["test"] = &clientcmdapi.Cluster{
+		Server:                   "https://127.0.0.1:6443",
+		CertificateAuthorityData: []byte("not a certificate"),
+	}
+	cfg.AuthInfos["test"] = &clientcmdapi.AuthInfo{}
+	cfg.Contexts["test"] = &clientcmdapi.Context{Cluster: "test", AuthInfo: "test"}
+	cfg.CurrentContext = "test"
+
+	g := &restConfigGetter{
+		clientConfig: clientcmd.NewDefaultClientConfig(*cfg, &clientcmd.ConfigOverrides{}),
+		namespace:    "default",
+	}
+
+	// The REST config is valid, but the HTTP client cannot load the CA data.
+	_, err := g.ToRESTConfig()
+	require.NoError(t, err)
+
+	dc, err := g.ToDiscoveryClient()
+	require.Error(t, err)
+	assert.Nil(t, dc)
 }
 
 func TestRestConfigGetterToRESTMapperBadConfig(t *testing.T) {

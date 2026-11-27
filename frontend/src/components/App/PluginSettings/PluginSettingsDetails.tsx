@@ -271,14 +271,29 @@ export function PluginSettingsDetailsPure(props: PluginSettingsDetailsPureProps)
                   ]
                 : []
             }
-            subtitle={author ? `${t('translation|By')}: ${author}` : undefined}
+            subtitle={
+              author ? (
+                <Typography
+                  component="span"
+                  variant="body2"
+                  color="text.secondary"
+                  sx={{ display: 'block', fontStyle: 'normal', mt: 0.5 }}
+                >
+                  {t('translation|Published by {{author}}', { author })}
+                </Typography>
+              ) : undefined
+            }
             noPadding={false}
             headerStyle="main"
           />
         }
         backLink={'/settings/plugins'}
       >
-        {plugin.description}
+        {plugin.description && (
+          <Typography color="text.secondary" sx={{ mb: 2 }}>
+            {plugin.description}
+          </Typography>
+        )}
         {plugin.isLoaded === false && plugin.overriddenBy && (
           <Box mt={2} p={2} sx={{ bgcolor: 'warning.light', borderRadius: 1 }}>
             <Typography variant="body2">
@@ -314,19 +329,12 @@ export function PluginSettingsDetailsPure(props: PluginSettingsDetailsPureProps)
             spacing={2}
             justifyContent="flex-start"
             alignItems="center"
-            sx={{ borderTop: '2px solid', borderColor: 'silver', padding: '10px' }}
+            sx={{ borderTop: '2px solid', borderColor: 'divider', padding: '10px' }}
           >
-            <Button
-              variant="contained"
-              disabled={!enableSaveButton}
-              style={{ backgroundColor: 'silver', color: 'black' }}
-              onClick={handleSave}
-            >
+            <Button variant="contained" disabled={!enableSaveButton} onClick={handleSave}>
               {t('translation|Save')}
             </Button>
-            <Button style={{ color: 'silver' }} onClick={handleCancel}>
-              {t('translation|Cancel')}
-            </Button>
+            <Button onClick={handleCancel}>{t('translation|Cancel')}</Button>
           </Stack>
         </Box>
       )}

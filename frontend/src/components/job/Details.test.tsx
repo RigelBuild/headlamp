@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-import { render } from '@testing-library/react';
+import { act, render } from '@testing-library/react';
 import React from 'react';
 import { TestContext } from '../../test';
 import JobDetails from './Details';
+import JobSuspendButton from './JobSuspendButton';
 
 const { mockDetailsGrid } = vi.hoisted(() => ({
   mockDetailsGrid: vi.fn(),
@@ -128,6 +129,54 @@ describe('JobDetails', () => {
     expect(statusField.hide).toBe(true);
   });
 
+  it('hides the index rows for a Job that does not set them', () => {
+    render(
+      <TestContext routerMap={{ namespace: 'default', name: 'test-job' }}>
+        <JobDetails />
+      </TestContext>
+    );
+
+    const extraInfo = mockDetailsGrid.mock.calls[0][0].extraInfo(fakeJob);
+    const row = (name: string) => extraInfo.find((f: any) => f.name === name);
+
+    for (const name of [
+      'Completed Indexes',
+      'Failed Indexes',
+      'Backoff Limit Per Index',
+      'Max Failed Indexes',
+    ]) {
+      expect(row(name).hide).toBe(true);
+    }
+  });
+
+  it('shows the completed and failed indexes and the per-index limits of an Indexed Job', () => {
+    const indexedJob: any = {
+      ...fakeJob,
+      spec: {
+        ...fakeJob.spec,
+        completionMode: 'Indexed',
+        backoffLimitPerIndex: 0,
+        maxFailedIndexes: 2,
+      },
+      status: { ...fakeJob.status, completedIndexes: '0,2', failedIndexes: '1,3-4' },
+    };
+
+    render(
+      <TestContext routerMap={{ namespace: 'default', name: 'test-job' }}>
+        <JobDetails />
+      </TestContext>
+    );
+
+    const extraInfo = mockDetailsGrid.mock.calls[0][0].extraInfo(indexedJob);
+    const row = (name: string) => extraInfo.find((f: any) => f.name === name);
+
+    expect(row('Completed Indexes')).toMatchObject({ value: '0,2', hide: false });
+    expect(row('Failed Indexes')).toMatchObject({ value: '1,3-4', hide: false });
+    // A limit of 0 means an index is not retried, and it is still shown.
+    expect(row('Backoff Limit Per Index')).toMatchObject({ value: 0, hide: false });
+    expect(row('Max Failed Indexes')).toMatchObject({ value: 2, hide: false });
+  });
+
   it('provides onResourceUpdate to DetailsGrid for tracking workload changes', () => {
     render(
       <TestContext routerMap={{ namespace: 'default', name: 'test-job' }}>
@@ -139,10 +188,50 @@ describe('JobDetails', () => {
     expect(props.onResourceUpdate).toBeDefined();
 
     // Should not throw when called with a resource
-    expect(() => props.onResourceUpdate(fakeJob)).not.toThrow();
+    expect(() => act(() => props.onResourceUpdate(fakeJob))).not.toThrow();
     // Should not throw when called with a different UID (triggers state reset)
     expect(() =>
-      props.onResourceUpdate({ ...fakeJob, metadata: { ...fakeJob.metadata, uid: 'new-uid' } })
+      act(() =>
+        props.onResourceUpdate({ ...fakeJob, metadata: { ...fakeJob.metadata, uid: 'new-uid' } })
+      )
     ).not.toThrow();
+  });
+
+  it('adds a suspend action for running jobs', () => {
+    render(
+      <TestContext routerMap={{ namespace: 'default', name: 'test-job' }}>
+        <JobDetails />
+      </TestContext>
+    );
+
+    const props = mockDetailsGrid.mock.calls[0][0];
+    const actions = props.actions(fakeJob);
+    const suspendAction = actions.find((action: any) => action.id === 'suspend');
+
+    expect(suspendAction.action.type).toBe(JobSuspendButton);
+    expect(suspendAction.action.props.item).toBe(fakeJob);
+  });
+
+  it('adds a resume action for suspended jobs', () => {
+    const suspendedJob = {
+      ...fakeJob,
+      spec: {
+        ...fakeJob.spec,
+        suspend: true,
+      },
+    };
+
+    render(
+      <TestContext routerMap={{ namespace: 'default', name: 'test-job' }}>
+        <JobDetails />
+      </TestContext>
+    );
+
+    const props = mockDetailsGrid.mock.calls[0][0];
+    const actions = props.actions(suspendedJob);
+    const suspendAction = actions.find((action: any) => action.id === 'suspend');
+
+    expect(suspendAction.action.type).toBe(JobSuspendButton);
+    expect(suspendAction.action.props.item).toBe(suspendedJob);
   });
 });
