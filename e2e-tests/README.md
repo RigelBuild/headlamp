@@ -23,7 +23,7 @@ Install the Playwright dependencies:
 ```bash
 cd e2e-tests
 npm ci
-npx playwright install --with-deps
+npx playwright install --with-deps chromium
 cd ..
 ```
 
@@ -83,24 +83,99 @@ rather than as an obvious configuration problem.
 `dynamicCluster.spec.ts` reads your kubeconfig with `kubectl config view`, which
 redacts embedded `certificate-authority-data` and the client certificate fields,
 and then reads the referenced files from disk. If those fields are embedded
-rather than file paths, six tests in that file fail with `ENOENT`.
+rather than file paths, seven tests in that file fail with `ENOENT`.
 
 CI works around this by rewriting the kubeconfig so the certificates live in
 files. If you hit those failures, do the same, and note that the paths must be
 absolute, because the test resolves them relative to its own working directory:
 
 ```bash
+umask 077
 mkdir -p ~/headlamp-e2e-certs
-kubectl config view --raw --minify --context=test -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode > ~/headlamp-e2e-certs/ca.crt
-kubectl config set-cluster kind-test --certificate-authority="$HOME/headlamp-e2e-certs/ca.crt" --embed-certs=false
-kubectl config unset clusters.kind-test.certificate-authority-data
+
+# test cluster
+kubectl config view --raw --minify --context=test -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode > ~/headlamp-e2e-certs/test-ca.crt
+kubectl config view --raw --minify --context=test -o jsonpath='{.users[0].user.client-certificate-data}' | base64 --decode > ~/headlamp-e2e-certs/test-client.crt
+kubectl config view --raw --minify --context=test -o jsonpath='{.users[0].user.client-key-data}' | base64 --decode > ~/headlamp-e2e-certs/test-client.key
+
+kubectl config set-cluster kind-test \
+  --certificate-authority="$HOME/headlamp-e2e-certs/test-ca.crt" \
+  --embed-certs=false
+
+kubectl config set-credentials admin@kind-test \
+  --client-certificate="$HOME/headlamp-e2e-certs/test-client.crt" \
+  --client-key="$HOME/headlamp-e2e-certs/test-client.key" \
+  --embed-certs=false
+
+# test2 cluster
+kubectl config view --raw --minify --context=test2 -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 --decode > ~/headlamp-e2e-certs/test2-ca.crt
+kubectl config view --raw --minify --context=test2 -o jsonpath='{.users[0].user.client-certificate-data}' | base64 --decode > ~/headlamp-e2e-certs/test2-client.crt
+kubectl config view --raw --minify --context=test2 -o jsonpath='{.users[0].user.client-key-data}' | base64 --decode > ~/headlamp-e2e-certs/test2-client.key
+
+kubectl config set-cluster kind-test2 \
+  --certificate-authority="$HOME/headlamp-e2e-certs/test2-ca.crt" \
+  --embed-certs=false
+
+kubectl config set-credentials admin@kind-test2 \
+  --client-certificate="$HOME/headlamp-e2e-certs/test2-client.crt" \
+  --client-key="$HOME/headlamp-e2e-certs/test2-client.key" \
+  --embed-certs=false
 ```
 
-Do the same for the `client-certificate-data` and `client-key-data` fields on
-the user entry. To update the second cluster, use `--context=test2` and the
-`kind-test2` cluster entry.
+### Namespace restrictions with mocked API traffic
+
+The two `legacy namespace API` tests in `tests/namespaceRestrictions.spec.ts`
+load a small plugin through Headlamp's plugin loader and exercise the public
+`useApiList` API. They cover initial selector gating after Home-to-project navigation,
+unselected-cluster resolution, live watch delivery and fail-closed cleanup,
+native cross-tab settings/cache recovery, and project/YAML
+form-state preservation during refresh. Mounting a settings resolver after a peer
+failure cannot restore older query data: only a newer successful query update may
+replace the tagged empty cache. A selector failure is a tagged empty cache,
+not a missing entry that older successful query results can restore.
+
+Config, plugin files, Kubernetes HTTP requests and WebSockets are intercepted,
+so these tests need a running Headlamp instance serving the built frontend but
+do not need cluster provisioning or a service-account token.
+
+From `e2e-tests/`, with `HEADLAMP_TEST_URL` pointing at that instance, run:
+
+```bash
+npx playwright test tests/namespaceRestrictions.spec.ts --project=chromium --grep "legacy namespace API"
+```
 
 ### Additional suites
+
+`tests/logStreaming.spec.ts` creates a temporary namespace and a logging Deployment
+on the real test cluster, then exercises pod logs and workload logs in both
+All Pods and selected-pod modes.
+It verifies incoming log lines, Since query parameters, cancellation of replaced
+streams, and Reconnect after a deliberately interrupted WebSocket. Log messages
+are forwarded from Kubernetes, not mocked. The namespace is deleted after each test.
+Run it against Headlamp built from the branch under test:
+
+```bash
+cd e2e-tests
+npx playwright test tests/logStreaming.spec.ts --project=chromium
+```
+
+It uses `HEADLAMP_TEST_URL` and `HEADLAMP_TEST_TOKEN` from the setup above.
+`HEADLAMP_TEST_CLUSTER` defaults to `test`; `HEADLAMP_TEST_BACKEND_TOKEN` defaults
+to `headlamp`. `HEADLAMP_TEST_TOKEN` is required. The test identity needs permission
+to create and delete namespaces and Deployments and to read pods and pod logs.
+
+`tests/pomeriumProxyAuth.spec.ts` verifies Headlamp behind the Pomerium Ingress Controller. Its harness creates a disposable kind cluster on the active Docker engine, deploys Dex as a test identity provider, and installs the local Headlamp chart. The harness pins the Kubernetes node image to `kindest/node:v1.36.1`.
+
+Prerequisites are Docker, kind, kubectl, Helm, OpenSSL, curl, Node.js, and Google Chrome. Run it from the repository root:
+
+```bash
+cd e2e-tests
+npm ci
+cd ..
+./e2e-tests/pomerium/run.sh
+```
+
+The [reference screenshot](pomerium/proof/headlamp-namespaces-through-pomerium.png) shows the authenticated identity in Headlamp. The harness writes the latest screenshot to `e2e-tests/pomerium/generated/pomerium-headlamp.png` and deletes its `headlamp-pomerium-e2e` kind cluster after a successful run. Set `KEEP_CLUSTER=1` to keep the cluster for inspection. The harness stops its port-forward processes when it exits. If a failed run leaves the cluster behind, remove that exact cluster with `kind delete cluster --name headlamp-pomerium-e2e`.
 
 `tests/incluster-api.spec.ts` tests a separate Headlamp deployment running in
 in-cluster mode. CI runs it in a dedicated step after deploying
@@ -132,12 +207,31 @@ npx playwright test tests/incluster-api.spec.ts
 
 ### Cluster Inventory
 
+The same OIDC assertions run for Cluster Inventory and Cluster API connections.
+The fixture publishes a v1beta2 Cluster and its standard kubeconfig Secret for
+`test2`; that Secret contains management credentials to verify that workload
+requests still use the signed-in user's identity. The fixture's minimal Cluster
+CRD tests discovery without installing provisioning controllers.
+
 The Cluster Inventory E2E uses the same `test` and `test2` clusters and the same
 Headlamp Deployment as the regular multi-cluster tests. It installs the v0.1.3
-Cluster Inventory API CRD on `test`, publishes one `ClusterProfile` for
-`test2`, and verifies both discovery and proxy access to a running pod in
-`tests/clusterInventory.spec.ts`. The generated `.env` enables this spec; it is
-otherwise skipped unless `HEADLAMP_CLUSTER_INVENTORY_E2E=true`.
+Cluster Inventory API CRD on `test` and publishes one `ClusterProfile`,
+`kube-system/inventory-test2`, for `test2`. Dex runs on `test`, and the `test2`
+API server is configured to trust it. Headlamp holds no shared credential for
+`test2`, so the signed-in user's own token decides what each request can do.
+
+`tests/clusterInventory.spec.ts` sends requests for the Pods in `inventory-demo`
+on `test2`:
+
+| Caller                      | Permission on `test2`                           | Expected result                                                                     |
+| --------------------------- | ----------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Unauthenticated request     | none                                            | `401`                                                                               |
+| `headlamp-e2e@example.com`  | `inventory-reader` Role (get, list, watch Pods) | List succeeds, a WebSocket watch delivers an `ADDED` event, creating a Pod is `403` |
+| `forbidden-e2e@example.com` | none                                            | List is `403`                                                                       |
+
+Both Dex users use the fixture password `headlamp-e2e-password`. The generated
+`.env` enables this spec; it is otherwise skipped unless
+`HEADLAMP_CLUSTER_INVENTORY_E2E=true`.
 
 ## Run all tests
 
@@ -149,6 +243,9 @@ otherwise skipped unless `HEADLAMP_CLUSTER_INVENTORY_E2E=true`.
 ```bash
 npx playwright test
 ```
+
+To use CI's settings (two workers, retries, and per-test durations in the
+output), run `CI=1 npx playwright test`.
 
 ## Run a single test
 
@@ -170,6 +267,26 @@ npx playwright test -g "404 page is present"
 ```shell
 npx playwright test -g "404 page is present" --headed
 ```
+
+## Writing tests
+
+CI runs the suite with two Playwright workers against the same clusters, so
+tests run in parallel and must not depend on each other:
+
+- Give the resources a test creates unique names (for example with
+  `Date.now()`) and delete them when the test ends.
+- Don't assume which row a list shows first. Lists sort newest first, and other
+  tests create pods in the `default` namespace while yours runs. Tests don't
+  create pods in `kube-system`, so pick one there when any pod will do.
+- Create fixtures such as namespaces through the API. CI loads every example
+  plugin, and the `sidebar` example removes the Namespaces page, so a test that
+  needs that page is skipped in CI.
+
+`HeadlampPage.navigateToCluster(cluster, token)` signs in by setting the
+backend's per-cluster auth cookie rather than filling in the login form. The
+login form is still covered by the login and logout tests in
+`multiCluster.spec.ts` and by `helmPlugins.spec.ts`, which runs against a
+non-root base URL.
 
 ## OAuth2-Proxy + Dex e2e test (opt-in)
 
@@ -198,21 +315,21 @@ Two modes are supported:
    npx playwright test tests/dexOauth2Proxy.spec.ts
    ```
 
-    The test runs
-    `../docs/installation/in-cluster/dex/test-scripts/run.sh`
-    in `beforeAll` and `cleanup.sh` in `afterAll`.
+   The test runs
+   `../docs/installation/in-cluster/dex/test-scripts/run.sh`
+   in `beforeAll` and `cleanup.sh` in `afterAll`.
 
 2. **Use a stack you already brought up:**
 
-    ```shell
-    cd ../docs/installation/in-cluster/dex/test-scripts
-    ./run.sh
-    cd -
-    export HEADLAMP_TEST_DEX_OAUTH2_PROXY=1
-    npx playwright test tests/dexOauth2Proxy.spec.ts
-    # …when done:
-    ../docs/installation/in-cluster/dex/test-scripts/cleanup.sh
-    ```
+   ```shell
+   cd ../docs/installation/in-cluster/dex/test-scripts
+   ./run.sh
+   cd -
+   export HEADLAMP_TEST_DEX_OAUTH2_PROXY=1
+   npx playwright test tests/dexOauth2Proxy.spec.ts
+   # …when done:
+   ../docs/installation/in-cluster/dex/test-scripts/cleanup.sh
+   ```
 
 The test points at `http://localhost:8080` (the port `run.sh`
 port-forwards to OAuth2-Proxy) and signs in to Dex as

@@ -17,12 +17,13 @@
 import { expect, test } from '@playwright/test';
 import { HeadlampPage } from './headlampPage';
 
-test('project overview displays only enabled plugin sections', async ({ page }) => {
+test('project overview and resources reflect the project namespace', async ({ page }) => {
   const token = process.env.HEADLAMP_TEST_TOKEN;
   test.skip(!token, 'HEADLAMP_TEST_TOKEN is required to create the project fixture.');
 
-  const projectName = `conditional-overview-${Date.now()}`;
+  const projectName = `project-overview-${Date.now()}`;
   const namespacePath = `/clusters/test/api/v1/namespaces/${projectName}`;
+  const configMapName = `${projectName}-config`;
   const headers = { Authorization: `Bearer ${token}` };
   const headlampPage = new HeadlampPage(page);
 
@@ -56,6 +57,17 @@ test('project overview displays only enabled plugin sections', async ({ page }) 
   expect(createResponse.status()).toBe(201);
 
   try {
+    const configMapResponse = await page.request.post(`${namespacePath}/configmaps`, {
+      headers,
+      data: {
+        apiVersion: 'v1',
+        kind: 'ConfigMap',
+        metadata: { name: configMapName, namespace: projectName },
+        data: { purpose: 'project e2e coverage' },
+      },
+    });
+    expect(configMapResponse.status(), await configMapResponse.text()).toBe(201);
+
     await headlampPage.navigateTopage(`/project/${projectName}`, /Project Details/);
 
     await expect(page.getByRole('progressbar', { name: 'Loading' })).toBeHidden({
@@ -63,6 +75,15 @@ test('project overview displays only enabled plugin sections', async ({ page }) 
     });
     await expect(page.getByText(`Custom resource usage for project ${projectName}`)).toBeVisible();
     await expect(page.getByText(`Multi-cluster project: ${projectName}`)).toHaveCount(0);
+
+    const emptySection = page.getByTestId('project-overview-section-empty-section');
+    await expect(emptySection).toHaveCount(1);
+    await expect(emptySection).toBeHidden();
+
+    // The Resources tab lists what the project namespace contains on the real cluster.
+    await page.getByRole('tab', { name: 'Resources' }).click();
+    await page.getByRole('button', { name: /Configuration/ }).click();
+    await expect(page.getByRole('cell', { name: configMapName })).toBeVisible();
   } finally {
     const deleteResponse = await page.request.delete(namespacePath, { headers });
     expect(deleteResponse.ok()).toBe(true);

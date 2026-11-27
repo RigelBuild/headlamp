@@ -1,4 +1,20 @@
-package serviceproxy //nolint
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package serviceproxy //nolint:testpackage // Tests exercise unexported service proxy internals.
 
 import (
 	"context"
@@ -19,7 +35,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 )
 
-//nolint:funlen
+//nolint:funlen // Table-driven test function covering service proxy request dispatching.
 func TestHandleServiceProxy(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -261,6 +277,8 @@ func TestRequestHandlerSendsNoCacheHeaders(t *testing.T) {
 	assert.Equal(t, "no-cache", resp.Header.Get("Pragma"))
 	assert.Equal(t, "0", resp.Header.Get("X-Accel-Expires"))
 	assert.NotEmpty(t, resp.Header.Get("Expires"))
+	assert.Equal(t, "sandbox", resp.Header.Get("Content-Security-Policy"))
+	assert.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
 }
 
 // createMockService creates a mock Kubernetes service for testing.
@@ -281,7 +299,7 @@ func createMockService(namespace, name string) *corev1.Service {
 	}
 }
 
-//nolint:funlen
+//nolint:funlen // Long test function containing multiple getAuthToken test scenarios.
 func TestGetAuthToken(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -322,22 +340,43 @@ func TestGetAuthToken(t *testing.T) {
 			expectError:   false,
 		},
 		{
-			name:        "cookie takes precedence over Authorization header",
+			// The OIDC refresh middleware puts a renewed token in Authorization
+			// while the request cookie still holds the expired one.
+			name:        "Authorization header takes precedence over cookie",
 			clusterName: "test-cluster",
 			setupRequest: func() *http.Request {
 				req := httptest.NewRequestWithContext(context.Background(), "GET", "/test", nil)
 				req.AddCookie(&http.Cookie{
 					Name:     "headlamp-auth-test-cluster.0",
-					Value:    "cookie-token-wins",
+					Value:    "cookie-token-loses",
 					HttpOnly: true,
 					Secure:   true,
 					SameSite: http.SameSiteStrictMode,
 				})
-				req.Header.Set("Authorization", "Bearer header-token-loses")
+				req.Header.Set("Authorization", "Bearer header-token-wins")
 
 				return req
 			},
-			expectedToken: "cookie-token-wins",
+			expectedToken: "header-token-wins",
+			expectError:   false,
+		},
+		{
+			name:        "empty bearer token in Authorization header falls back to cookie",
+			clusterName: "test-cluster",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequestWithContext(context.Background(), "GET", "/test", nil)
+				req.AddCookie(&http.Cookie{
+					Name:     "headlamp-auth-test-cluster.0",
+					Value:    "cookie-token-xyz",
+					HttpOnly: true,
+					Secure:   true,
+					SameSite: http.SameSiteStrictMode,
+				})
+				req.Header.Set("Authorization", "Bearer ")
+
+				return req
+			},
+			expectedToken: "cookie-token-xyz",
 			expectError:   false,
 		},
 		{
@@ -398,7 +437,7 @@ func TestGetAuthToken(t *testing.T) {
 			expectedToken: "spaced-token",
 			expectError:   false,
 		},
-		{ //nolint:gosec
+		{ //nolint:gosec // Hardcoded mock bearer token string used strictly for unit testing.
 			name:        "valid token with Bearer prefix",
 			clusterName: "test-cluster",
 			setupRequest: func() *http.Request {
@@ -443,7 +482,7 @@ func TestGetAuthToken(t *testing.T) {
 	}
 }
 
-//nolint:funlen
+//nolint:funlen // Long test function covering multiple GetServiceFromCluster error scenarios.
 func TestGetServiceFromCluster(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -500,7 +539,16 @@ func TestGetServiceFromCluster(t *testing.T) {
 				"forbidden-service",
 				nil,
 			),
-			expectedStatus: http.StatusNotFound,
+			expectedStatus: http.StatusForbidden,
+			expectError:    true,
+		},
+		{
+			name:           "internal server error from cluster",
+			namespace:      "default",
+			serviceName:    "failing-service",
+			setupService:   false,
+			mockError:      k8serrors.NewInternalError(errors.New("etcd connection timeout")),
+			expectedStatus: http.StatusInternalServerError,
 			expectError:    true,
 		},
 	}
@@ -542,7 +590,7 @@ func TestGetServiceFromCluster(t *testing.T) {
 	}
 }
 
-//nolint:funlen
+//nolint:funlen // Table-driven test function covering request URI parsing edge cases.
 func TestParseInfoFromRequest(t *testing.T) {
 	tests := []struct {
 		name                string

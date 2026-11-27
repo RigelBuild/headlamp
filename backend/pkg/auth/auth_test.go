@@ -18,6 +18,7 @@ package auth_test
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -270,6 +271,59 @@ func TestParseClusterAndToken(t *testing.T) {
 	}
 }
 
+func TestStripBaseURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		baseURL string
+		want    string
+	}{
+		{"no base URL", "/clusters/main/api", "", "/clusters/main/api"},
+		{"strips base URL", "/dev/headlamp/clusters/main/api", "/dev/headlamp", "/clusters/main/api"},
+		{"base URL with trailing slash", "/dev/headlamp/clusters/main/api", "/dev/headlamp/", "/clusters/main/api"},
+		{"path is the base URL", "/dev/headlamp", "/dev/headlamp", "/"},
+		{"only matches on a segment boundary", "/dev/hlx/clusters/main/api", "/dev/hl", "/dev/hlx/clusters/main/api"},
+		{"path outside base URL", "/clusters/main/api", "/dev/headlamp", "/clusters/main/api"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, auth.StripBaseURL(tt.path, tt.baseURL))
+		})
+	}
+}
+
+func TestParseClusterAndTokenWithBaseURL(t *testing.T) {
+	const baseURL = "/dev/internal/headlamp"
+
+	tests := []struct {
+		name        string
+		url         string
+		wantCluster string
+		wantToken   string
+	}{
+		{"cluster request under base URL", baseURL + "/clusters/main/api/v1/pods", "main", "cookie-token"},
+		{"request outside base URL", "/other/clusters/main/api/v1/pods", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, tt.url, nil)
+			req.AddCookie(&http.Cookie{
+				Name:     fmt.Sprintf("headlamp-auth-%s.0", auth.SanitizeClusterName("main")),
+				Value:    "cookie-token",
+				HttpOnly: true,
+				Secure:   true,
+				SameSite: http.SameSiteStrictMode,
+			})
+
+			cluster, token := auth.ParseClusterAndTokenWithBaseURL(req, baseURL)
+			assert.Equal(t, tt.wantCluster, cluster)
+			assert.Equal(t, tt.wantToken, token)
+		})
+	}
+}
+
 var berlinLocation = func() *time.Location {
 	loc, err := time.LoadLocation("Europe/Berlin")
 	if err != nil {
@@ -445,6 +499,10 @@ func (cacheStub) Get(ctx context.Context, k string) (interface{}, error) {
 	return nil, nil
 }
 
+func (cacheStub) UpdateIf(context.Context, string, interface{}, func(interface{}) bool) error {
+	return cache.ErrNotFound
+}
+
 func (cacheStub) GetAll(ctx context.Context, _ cache.Matcher) (map[string]interface{}, error) {
 	return map[string]interface{}{}, nil
 }
@@ -473,6 +531,11 @@ type fakeCache struct {
 		val interface{}
 		ttl time.Duration
 	}
+	deleteCalls    []string
+	updateTTLCalls []struct {
+		key string
+		ttl time.Duration
+	}
 	errOnGet, errOnSet, errOnSetWithTTL error
 }
 
@@ -499,6 +562,29 @@ func (f *fakeCache) Set(_ context.Context, key string, val interface{}) error {
 	return f.errOnSet
 }
 
+func (f *fakeCache) UpdateIf(ctx context.Context, key string, val interface{}, matches func(interface{}) bool) error {
+	if f.errOnGet != nil {
+		return f.errOnGet
+	}
+
+	current, ok := f.store[key]
+	if !ok {
+		return cache.ErrNotFound
+	}
+
+	if !matches(current) {
+		return errors.New("cache entry changed")
+	}
+
+	if err := f.Set(ctx, key, val); err != nil {
+		return err
+	}
+
+	f.store[key] = val
+
+	return nil
+}
+
 func (f *fakeCache) SetWithTTL(_ context.Context, key string, val interface{}, ttl time.Duration) error {
 	f.setWithTTLCalls = append(f.setWithTTLCalls, struct {
 		key string
@@ -507,6 +593,20 @@ func (f *fakeCache) SetWithTTL(_ context.Context, key string, val interface{}, t
 	}{key, val, ttl})
 
 	return f.errOnSetWithTTL
+}
+
+func (f *fakeCache) Delete(_ context.Context, key string) error {
+	f.deleteCalls = append(f.deleteCalls, key)
+	return nil
+}
+
+func (f *fakeCache) UpdateTTL(_ context.Context, key string, ttl time.Duration) error {
+	f.updateTTLCalls = append(f.updateTTLCalls, struct {
+		key string
+		ttl time.Duration
+	}{key, ttl})
+
+	return nil
 }
 
 func tokenWithExtra(tokenType, tokenValue string) *oauth2.Token {
@@ -690,6 +790,17 @@ func findAuthCookie(resp *http.Response, cluster string) (string, bool) {
 	return "", false
 }
 
+func findIDTokenCookie(resp *http.Response, cluster string) (string, bool) {
+	want := fmt.Sprintf("headlamp-id-token-%s.0", auth.SanitizeClusterName(cluster))
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == want {
+			return cookie.Value, true
+		}
+	}
+
+	return "", false
+}
+
 var oauthSuccessBody = map[string]any{
 	"access_token":  "AT",
 	"token_type":    "Bearer",
@@ -704,7 +815,7 @@ func TestGetNewToken_Success(t *testing.T) {
 	// Seed cache with old token -> old refresh mapping
 	fc := &fakeCache{store: map[string]interface{}{"oidc-token-OLD": "REFRESH_OLD"}}
 
-	newTok, err := auth.GetNewToken("cid", "secret", fc, "id_token", "OLD", srv.URL, context.Background())
+	newTok, err := auth.GetNewToken("cid", "secret", fc, "id_token", "OLD", srv.URL, context.Background(), time.Hour)
 	if err != nil {
 		t.Fatalf("GetNewToken unexpected error: %v", err)
 	}
@@ -722,8 +833,8 @@ func TestGetNewToken_Success(t *testing.T) {
 	}
 
 	// CacheRefreshedToken side-effects
-	if len(fc.setCalls) != 1 || len(fc.setWithTTLCalls) != 1 {
-		t.Fatalf("expected Set=1, SetWithTTL=1; got Set=%d, SetWithTTL=%d",
+	if len(fc.setCalls) != 1 || len(fc.setWithTTLCalls) != 2 {
+		t.Fatalf("expected Set=1, SetWithTTL=2; got Set=%d, SetWithTTL=%d",
 			len(fc.setCalls), len(fc.setWithTTLCalls))
 	}
 
@@ -732,11 +843,45 @@ func TestGetNewToken_Success(t *testing.T) {
 			fc.setCalls[0].key, fc.setCalls[0].val, "oidc-token-NEW", refreshNew)
 	}
 
-	call := fc.setWithTTLCalls[0]
+	idTokenCall := fc.setWithTTLCalls[0]
+	if idTokenCall.key != "oidc-id-token-NEW" || idTokenCall.val != "NEW" || idTokenCall.ttl <= 0 {
+		t.Fatalf("ID token SetWithTTL call = {%q,%v,%v}", idTokenCall.key, idTokenCall.val, idTokenCall.ttl)
+	}
+
+	call := fc.setWithTTLCalls[1]
 	if call.key != "oidc-token-OLD" || call.val != "REFRESH_OLD" || call.ttl != 10*time.Second {
 		t.Fatalf("SetWithTTL = {%q,%v,%v}, want {%q,%q,%v}",
 			call.key, call.val, call.ttl, "oidc-token-OLD", "REFRESH_OLD", 10*time.Second)
 	}
+
+	assert.Empty(t, fc.deleteCalls)
+	require.Len(t, fc.updateTTLCalls, 1)
+	assert.Equal(t, "oidc-id-token-OLD", fc.updateTTLCalls[0].key)
+	assert.Equal(t, 10*time.Second, fc.updateTTLCalls[0].ttl)
+}
+
+func TestGetNewToken_IDTokenOmittedRetainsRotatedRefreshToken(t *testing.T) {
+	srv := newTokenServerJSON(t, http.StatusOK, map[string]any{
+		"access_token":  "AT",
+		"token_type":    "Bearer",
+		"expires_in":    3600,
+		"refresh_token": refreshNew,
+	})
+	fc := &fakeCache{store: map[string]interface{}{
+		"oidc-token-OLD":    "REFRESH_OLD",
+		"oidc-id-token-OLD": "OLD",
+	}}
+
+	newTok, err := auth.GetNewToken("cid", "secret", fc, "id_token", "OLD", srv.URL, context.Background(), time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, "OLD", newTok.Extra("id_token"))
+
+	require.Len(t, fc.setCalls, 1)
+	assert.Equal(t, "oidc-token-OLD", fc.setCalls[0].key)
+	assert.Equal(t, refreshNew, fc.setCalls[0].val)
+	require.Len(t, fc.setWithTTLCalls, 1)
+	assert.Equal(t, "oidc-id-token-OLD", fc.setWithTTLCalls[0].key)
+	assert.Empty(t, fc.deleteCalls)
 }
 
 func TestGetNewToken_PreHTTPFailures(t *testing.T) {
@@ -763,7 +908,8 @@ func TestGetNewToken_PreHTTPFailures(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Fails before HTTP; no server needed.
-			_, err := auth.GetNewToken("cid", "secret", tc.cache, "id_token", "OLD", "http://127.0.0.1", context.Background())
+			_, err := auth.GetNewToken(
+				"cid", "secret", tc.cache, "id_token", "OLD", "http://127.0.0.1", context.Background(), time.Hour)
 			if err == nil || !strings.Contains(err.Error(), tc.expect) {
 				t.Fatalf("want error containing %q, got %v", tc.expect, err)
 			}
@@ -786,7 +932,8 @@ func TestGetNewToken_EndpointFailures(t *testing.T) {
 			srv := newTokenServerJSON(t, tc.status, tc.body)
 			fc := &fakeCache{store: map[string]interface{}{"oidc-token-OLD": "REFRESH_OLD"}}
 
-			if _, err := auth.GetNewToken("cid", "secret", fc, "id_token", "OLD", srv.URL, context.Background()); err == nil {
+			if _, err := auth.GetNewToken(
+				"cid", "secret", fc, "id_token", "OLD", srv.URL, context.Background(), time.Hour); err == nil {
 				t.Fatal("expected error, got nil")
 			}
 		})
@@ -810,7 +957,8 @@ func TestGetNewToken_CacheUpdateErrors(t *testing.T) {
 				errOnSetWithTTL: tc.setTTLErr,
 			}
 
-			if _, err := auth.GetNewToken("cid", "secret", fc, "id_token", "OLD", srv.URL, context.Background()); err == nil {
+			if _, err := auth.GetNewToken(
+				"cid", "secret", fc, "id_token", "OLD", srv.URL, context.Background(), time.Hour); err == nil {
 				t.Fatal("expected error containing 'caching refreshed token', got nil")
 			}
 		})
@@ -825,6 +973,7 @@ func TestRefreshAndCacheNewToken_Success(t *testing.T) {
 
 	fc := &fakeCache{store: map[string]interface{}{oldKey: "REFRESH_OLD"}}
 	srv := newOIDCProviderServer(t, "", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 		require.NoError(t, r.ParseForm())
 		require.Equal(t, "refresh_token", r.PostForm.Get("grant_type"))
 		require.Equal(t, "REFRESH_OLD", r.PostForm.Get("refresh_token"))
@@ -837,7 +986,8 @@ func TestRefreshAndCacheNewToken_Success(t *testing.T) {
 	})
 
 	config := &kubeconfig.OidcConfig{ClientID: "cid", ClientSecret: "secret"}
-	tok, err := auth.RefreshAndCacheNewToken(context.Background(), config, fc, "id_token", oldToken, srv.URL, "")
+	tok, err := auth.RefreshAndCacheNewToken(
+		context.Background(), config, fc, "id_token", oldToken, srv.URL, "", time.Hour)
 	require.NoError(t, err)
 	assert.NotNil(t, tok)
 	assert.Equal(t, refreshNew, tok.RefreshToken)
@@ -846,10 +996,17 @@ func TestRefreshAndCacheNewToken_Success(t *testing.T) {
 	assert.Equal(t, "oidc-token-NEW", fc.setCalls[0].key)
 	assert.Equal(t, refreshNew, fc.setCalls[0].val)
 
-	require.Len(t, fc.setWithTTLCalls, 1)
-	assert.Equal(t, oldKey, fc.setWithTTLCalls[0].key)
-	assert.Equal(t, "REFRESH_OLD", fc.setWithTTLCalls[0].val)
-	assert.Equal(t, 10*time.Second, fc.setWithTTLCalls[0].ttl)
+	require.Len(t, fc.setWithTTLCalls, 2)
+	assert.Equal(t, "oidc-id-token-NEW", fc.setWithTTLCalls[0].key)
+	assert.Equal(t, "NEW", fc.setWithTTLCalls[0].val)
+	assert.Positive(t, fc.setWithTTLCalls[0].ttl)
+	assert.Equal(t, oldKey, fc.setWithTTLCalls[1].key)
+	assert.Equal(t, "REFRESH_OLD", fc.setWithTTLCalls[1].val)
+	assert.Equal(t, 10*time.Second, fc.setWithTTLCalls[1].ttl)
+	assert.Empty(t, fc.deleteCalls)
+	require.Len(t, fc.updateTTLCalls, 1)
+	assert.Equal(t, "oidc-id-token-"+oldToken, fc.updateTTLCalls[0].key)
+	assert.Equal(t, 10*time.Second, fc.updateTTLCalls[0].ttl)
 }
 
 func TestRefreshAndCacheNewToken_ValidatorIssuerOverride(t *testing.T) {
@@ -862,6 +1019,7 @@ func TestRefreshAndCacheNewToken_ValidatorIssuerOverride(t *testing.T) {
 
 	fc := &fakeCache{store: map[string]interface{}{oldKey: refreshToken}}
 	srv := newOIDCProviderServer(t, issuerURL, func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 		require.NoError(t, r.ParseForm())
 		require.Equal(t, "refresh_token", r.PostForm.Get("grant_type"))
 		require.Equal(t, refreshToken, r.PostForm.Get("refresh_token"))
@@ -871,11 +1029,12 @@ func TestRefreshAndCacheNewToken_ValidatorIssuerOverride(t *testing.T) {
 	})
 
 	config := &kubeconfig.OidcConfig{ClientID: "cid", ClientSecret: "secret"}
-	_, err := auth.RefreshAndCacheNewToken(context.Background(), config, fc, "id_token", oldToken, srv.URL, "")
+	_, err := auth.RefreshAndCacheNewToken(context.Background(), config, fc, "id_token", oldToken, srv.URL, "", time.Hour)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "did not match")
 
-	tok, err := auth.RefreshAndCacheNewToken(context.Background(), config, fc, "id_token", oldToken, srv.URL, issuerURL)
+	tok, err := auth.RefreshAndCacheNewToken(
+		context.Background(), config, fc, "id_token", oldToken, srv.URL, issuerURL, time.Hour)
 	require.NoError(t, err)
 	assert.NotNil(t, tok)
 	assert.Equal(t, refreshNew, tok.RefreshToken)
@@ -889,7 +1048,7 @@ func TestRefreshAndCacheNewToken_ProviderError(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	_, err := auth.RefreshAndCacheNewToken(
-		context.Background(), config, &fakeCache{}, "id_token", "OLD", srv.URL, "",
+		context.Background(), config, &fakeCache{}, "id_token", "OLD", srv.URL, "", time.Hour,
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "getting provider")
@@ -906,7 +1065,7 @@ func TestRefreshAndCacheNewToken_TokenError(t *testing.T) {
 	})
 
 	config := &kubeconfig.OidcConfig{ClientID: "cid", ClientSecret: "secret"}
-	_, err := auth.RefreshAndCacheNewToken(context.Background(), config, fc, "id_token", oldToken, srv.URL, "")
+	_, err := auth.RefreshAndCacheNewToken(context.Background(), config, fc, "id_token", oldToken, srv.URL, "", time.Hour)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "refreshing token")
 	assert.Len(t, fc.setCalls, 0)
@@ -954,6 +1113,10 @@ func TestRefreshAndSetToken_DefaultsToIDToken(t *testing.T) {
 	cookieVal, ok := findAuthCookie(resp, cluster)
 	require.True(t, ok, "expected auth cookie to be set")
 	assert.Equal(t, "NEW", cookieVal)
+
+	idToken, ok := findIDTokenCookie(resp, cluster)
+	require.True(t, ok, "expected refreshed ID token cookie to be set")
+	assert.Equal(t, "NEW", idToken)
 }
 
 func TestRefreshAndSetToken_UsesAccessToken(t *testing.T) {
@@ -969,7 +1132,68 @@ func TestRefreshAndSetToken_UsesAccessToken(t *testing.T) {
 		"token_type":    "Bearer",
 		"expires_in":    3600,
 		"refresh_token": refreshNew,
-		"id_token":      "IGNORED",
+		"id_token":      "ID_NEW",
+	}
+
+	srv := newOIDCProviderServer(t, "", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		require.NoError(t, r.ParseForm())
+		require.Equal(t, "REFRESH_OLD", r.PostForm.Get("refresh_token"))
+
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(tokenBody))
+	})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/clusters/"+cluster, nil)
+	rr := httptest.NewRecorder()
+
+	auth.RefreshAndSetToken(auth.RefreshAndSetTokenParams{
+		Ctx:                context.Background(),
+		OIDCAuthConfig:     &kubeconfig.OidcConfig{ClientID: "cid", ClientSecret: "secret"},
+		Cache:              fc,
+		Token:              oldToken,
+		Cluster:            cluster,
+		Writer:             rr,
+		Request:            req,
+		TelemetryHandler:   &telemetry.RequestHandler{},
+		OIDCUseAccessToken: true,
+		OIDCIdpIssuerURL:   srv.URL,
+		BaseURL:            "",
+		SessionTTL:         90,
+	})
+
+	resp := rr.Result()
+
+	defer func() { _ = resp.Body.Close() }()
+
+	cookieVal, ok := findAuthCookie(resp, cluster)
+	require.True(t, ok, "expected auth cookie to be set")
+	assert.Equal(t, "ACCESS_NEW", cookieVal)
+	assert.Equal(t, "Bearer ACCESS_NEW", req.Header.Get("Authorization"))
+
+	idToken, ok := findIDTokenCookie(resp, cluster)
+	require.True(t, ok, "expected refreshed ID token cookie to be set")
+	assert.Equal(t, "ID_NEW", idToken)
+	assert.Equal(t, 90*time.Second, fc.setWithTTLCalls[0].ttl)
+}
+
+//nolint:funlen // The regression test covers the complete refresh and cookie/cache lifecycle.
+func TestRefreshAndSetToken_AccessTokenWithoutIDTokenPreservesLogoutCookie(t *testing.T) {
+	const (
+		oldToken = "OLD"
+		cluster  = "access-token-without-id-token"
+	)
+
+	fc := &fakeCache{store: map[string]interface{}{
+		"oidc-token-" + oldToken:    "REFRESH_OLD",
+		"oidc-id-token-" + oldToken: "ID_ORIGINAL",
+	}}
+
+	tokenBody := map[string]any{
+		"access_token":  "ACCESS_NEW",
+		"token_type":    "Bearer",
+		"expires_in":    3600,
+		"refresh_token": refreshNew,
 	}
 
 	srv := newOIDCProviderServer(t, "", func(w http.ResponseWriter, r *http.Request) {
@@ -1005,6 +1229,74 @@ func TestRefreshAndSetToken_UsesAccessToken(t *testing.T) {
 	cookieVal, ok := findAuthCookie(resp, cluster)
 	require.True(t, ok, "expected auth cookie to be set")
 	assert.Equal(t, "ACCESS_NEW", cookieVal)
+
+	idToken, ok := findIDTokenCookie(resp, cluster)
+	require.True(t, ok, "expected cached ID token cookie to be renewed")
+	assert.Equal(t, "ID_ORIGINAL", idToken)
+
+	require.NotEmpty(t, fc.setWithTTLCalls)
+	idTokenCacheCall := fc.setWithTTLCalls[0]
+	assert.Equal(t, "oidc-id-token-ACCESS_NEW", idTokenCacheCall.key)
+	assert.Equal(t, "ID_ORIGINAL", idTokenCacheCall.val)
+	assert.Equal(t, 24*time.Hour, idTokenCacheCall.ttl)
+	assert.Empty(t, fc.deleteCalls)
+	require.Len(t, fc.updateTTLCalls, 1)
+	assert.Equal(t, "oidc-id-token-"+oldToken, fc.updateTTLCalls[0].key)
+	assert.Equal(t, 10*time.Second, fc.updateTTLCalls[0].ttl)
+}
+
+func TestTwoRefreshesFromOldAccessTokenRetainLogoutHint(t *testing.T) {
+	tokenCache := cache.New[interface{}]()
+
+	t.Cleanup(func() { require.NoError(t, tokenCache.Close()) })
+
+	ctx := context.Background()
+	require.NoError(t, tokenCache.Set(ctx, "oidc-token-OLD", "REFRESH_OLD"))
+	require.NoError(t, auth.CacheIDToken(ctx, tokenCache, "OLD", "ID_ORIGINAL", time.Hour))
+
+	srv := newTokenServerJSON(t, http.StatusOK, map[string]any{
+		"access_token": "ACCESS_NEW", "token_type": "Bearer",
+		"expires_in": 3600, "refresh_token": refreshNew,
+	})
+
+	for range 2 {
+		token, err := auth.GetNewToken("cid", "secret", tokenCache, "access_token", "OLD", srv.URL, ctx, time.Hour)
+		require.NoError(t, err)
+		assert.Equal(t, "ID_ORIGINAL", token.Extra("id_token"))
+
+		hint, err := tokenCache.Get(ctx, "oidc-id-token-ACCESS_NEW")
+		require.NoError(t, err)
+		assert.Equal(t, "ID_ORIGINAL", hint)
+	}
+
+	hint, err := tokenCache.Get(ctx, "oidc-id-token-OLD")
+	require.NoError(t, err)
+	assert.Equal(t, "ID_ORIGINAL", hint)
+}
+
+func TestAccessTokenExpiryDoesNotExpireSessionLogoutHint(t *testing.T) {
+	tokenCache := cache.New[interface{}]()
+
+	t.Cleanup(func() { require.NoError(t, tokenCache.Close()) })
+
+	ctx := context.Background()
+	require.NoError(t, tokenCache.Set(ctx, "oidc-token-OLD", "REFRESH_OLD"))
+	require.NoError(t, auth.CacheIDToken(ctx, tokenCache, "OLD", "ID_ORIGINAL", time.Hour))
+
+	srv := newTokenServerJSON(t, http.StatusOK, map[string]any{
+		"access_token": "ACCESS_NEW", "token_type": "Bearer",
+		"expires_in": 1, "refresh_token": refreshNew,
+	})
+
+	token, err := auth.GetNewToken("cid", "secret", tokenCache, "access_token", "OLD", srv.URL, ctx, time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, "ID_ORIGINAL", token.Extra("id_token"))
+	time.Sleep(time.Until(token.Expiry) + 10*time.Millisecond)
+	require.False(t, token.Valid())
+
+	token, err = auth.GetNewToken("cid", "secret", tokenCache, "access_token", "ACCESS_NEW", srv.URL, ctx, time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, "ID_ORIGINAL", token.Extra("id_token"))
 }
 
 func TestRefreshAndSetToken_ErrorDoesNotSetCookie(t *testing.T) {
@@ -1157,6 +1449,49 @@ func TestConfigureTLSContext_CACert_PreservesDefaults(t *testing.T) {
 	assert.NotNil(t, tr.TLSClientConfig.RootCAs, "RootCAs should be set")
 }
 
+func TestConfigureTLSContextPreservesClonedMinimumVersion(t *testing.T) {
+	original := http.DefaultTransport
+	base := original.(*http.Transport).Clone()
+	base.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+	http.DefaultTransport = base
+
+	t.Cleanup(func() {
+		http.DefaultTransport = original
+	})
+
+	skipTLSVerify := true
+	ctx := auth.ConfigureTLSContext(context.Background(), &skipTLSVerify, nil)
+	client, ok := ctx.Value(oauth2.HTTPClient).(*http.Client)
+	require.True(t, ok)
+	transport, ok := client.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.Equal(t, uint16(tls.VersionTLS13), transport.TLSClientConfig.MinVersion)
+}
+
+func TestConfigureTLSContextConnectsToTLS12OnlyOIDCProvider(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	//nolint:gosec // Intentionally only accepts TLS 1.2 to verify backwards compatibility.
+	server.TLS = &tls.Config{MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	skipTLSVerify := true
+	ctx := auth.ConfigureTLSContext(context.Background(), &skipTLSVerify, nil)
+	client := ctx.Value(oauth2.HTTPClient).(*http.Client)
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
+	require.NoError(t, err)
+	response, err := client.Do(request)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		require.NoError(t, response.Body.Close())
+	})
+
+	assert.Equal(t, http.StatusNoContent, response.StatusCode)
+}
+
 func makeTestToken(t *testing.T, claims map[string]interface{}) string {
 	// helper to build unsigned JWT-like string for tests
 	header := map[string]string{"alg": "none", "typ": "JWT"}
@@ -1222,6 +1557,44 @@ func TestHandleMe_Success(t *testing.T) {
 	assert.Equal(t, "Cookie", rr.Header().Get("Vary"))
 }
 
+func TestHandleMe_BaseURL(t *testing.T) {
+	t.Parallel()
+
+	token := makeTestToken(t, map[string]interface{}{
+		"preferred_username": "alice",
+		"exp":                float64(time.Now().Add(time.Hour).Unix()),
+	})
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		"/dev/internal/headlamp/clusters/test/me", nil)
+	req = mux.SetURLVars(req, map[string]string{"clusterName": "test"})
+	req.AddCookie(&http.Cookie{
+		Name:     fmt.Sprintf("headlamp-auth-%s.0", auth.SanitizeClusterName("test")),
+		Value:    token,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+	})
+
+	rr := httptest.NewRecorder()
+
+	handler := auth.HandleMe(auth.MeHandlerOptions{
+		UsernamePaths: "preferred_username",
+		BaseURL:       "/dev/internal/headlamp",
+	})
+
+	handler(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var got struct {
+		Username string `json:"username"`
+	}
+
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	assert.Equal(t, "alice", got.Username)
+}
+
 func TestHandleMe_HeaderToken(t *testing.T) {
 	t.Parallel()
 
@@ -1261,6 +1634,41 @@ func TestHandleMe_HeaderToken(t *testing.T) {
 	assert.Equal(t, "alice", got.Username)
 	assert.Equal(t, "alice@example.com", got.Email)
 	assert.Equal(t, []string{"dev", "ops"}, got.Groups)
+}
+
+func TestHandleMe_SingleStringGroupsClaim(t *testing.T) {
+	t.Parallel()
+
+	expiry := time.Now().Add(time.Hour).Unix()
+	claims := map[string]interface{}{
+		"preferred_username": "alice",
+		"groups":             "dev",
+		"exp":                float64(expiry),
+	}
+
+	token := makeTestToken(t, claims)
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/clusters/test/me", nil)
+	req = mux.SetURLVars(req, map[string]string{"clusterName": "test"})
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	rr := httptest.NewRecorder()
+
+	handler := auth.HandleMe(auth.MeHandlerOptions{
+		UsernamePaths: "preferred_username",
+		GroupsPaths:   "groups",
+	})
+
+	handler(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var got struct {
+		Groups []string `json:"groups"`
+	}
+
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &got))
+	assert.Equal(t, []string{"dev"}, got.Groups)
 }
 
 func TestHandleMe_ProxyAuth(t *testing.T) {

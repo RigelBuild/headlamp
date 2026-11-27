@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   node: undefined as GraphNode | undefined,
   nodeSelection: undefined as string | undefined,
   setNodeSelection: vi.fn(),
+  drawerLocation: 'split-right' as string,
 }));
 
 vi.mock('../graphViewContext', () => ({
@@ -36,6 +37,11 @@ vi.mock('../graphViewContext', () => ({
 
 vi.mock('../../activity/Activity', () => ({
   Activity: { launch: (...args: any[]) => mocks.activityLaunch(...args) },
+}));
+
+vi.mock('../../../redux/hooks', () => ({
+  useTypedSelector: (selector: any) =>
+    selector({ drawerMode: { detailsDrawerLocation: mocks.drawerLocation } }),
 }));
 
 vi.mock('../../../lib/k8s/cluster', () => ({}));
@@ -135,6 +141,7 @@ describe('KubeObjectNodeComponent', () => {
     mocks.node = undefined;
     mocks.nodeSelection = undefined;
     mocks.setNodeSelection.mockReset();
+    mocks.drawerLocation = 'split-right';
   });
 
   afterEach(() => {
@@ -217,6 +224,34 @@ describe('KubeObjectNodeComponent', () => {
     expect(label.parentElement).toHaveClass('label-container');
   });
 
+  it('clamps the label to two lines at rest, with a reveal hook for hover/focus', () => {
+    mocks.node = {
+      id: 'deployment',
+      kubeObject: makeKubeObject({
+        apiVersion: 'apps/v1',
+        kind: 'Deployment',
+        name: 'frontend-deployment-with-a-long-name',
+      }),
+      status: 'success',
+    };
+
+    render(<KubeObjectNodeComponent {...nodeProps('deployment')} />);
+
+    const label = screen.getByText('frontend-deployment-with-a-long-name');
+    // The clamp keeps the label within the node's fixed-size card at rest. The
+    // `node-title` class is targeted by Container's `:hover`/`:focus-within`
+    // styles to remove the clamp and reveal the full label (see
+    // KubeObjectNode.tsx `& .node-title` rules) -- jsdom does not evaluate
+    // those pseudo-class rules, so this only asserts the resting clamp and
+    // the hook the reveal relies on.
+    expect(label).toHaveClass('node-title');
+    expect(label).toHaveStyle({
+      display: '-webkit-box',
+      WebkitLineClamp: '2',
+      overflow: 'hidden',
+    });
+  });
+
   it('uses the highest-weight child object and shows a collapsed warning and count', () => {
     mocks.node = {
       id: 'group',
@@ -283,6 +318,7 @@ describe('KubeObjectNodeComponent', () => {
       cluster: 'test-cluster',
       hideTitleInHeader: true,
       id: 'pod',
+      kind: 'details',
       location: 'split-right',
       temporary: true,
       title: 'frontend-pod',
@@ -295,6 +331,23 @@ describe('KubeObjectNodeComponent', () => {
     });
     expect(payload.content.props.node).toBe(mocks.node);
   });
+
+  it.each([['split-left'], ['split-bottom']])(
+    'forwards the selected drawer location (%s) to Activity.launch',
+    location => {
+      mocks.drawerLocation = location;
+      mocks.node = {
+        id: 'pod',
+        kubeObject: makeKubeObject({ name: 'frontend-pod' }),
+      };
+
+      render(<KubeObjectNodeComponent {...nodeProps('pod')} />);
+      fireEvent.click(screen.getByRole('button'));
+
+      expect(mocks.activityLaunch).toHaveBeenCalledTimes(1);
+      expect(mocks.activityLaunch.mock.calls[0][0]).toMatchObject({ location });
+    }
+  );
 
   it('launches custom details without an activity icon or cluster', () => {
     const Details = () => <span>Custom details</span>;
@@ -377,7 +430,8 @@ describe('KubeObjectNodeComponent', () => {
     act(() => vi.advanceTimersByTime(1));
     expect(screen.getByTestId('node-glance')).toHaveTextContent('hovered');
     expect(button).toHaveClass('kube-object-node--expanded');
-    expect(button).toHaveStyle({ zIndex: '10000' });
+    // Let the outer wrapper own stacking so back cards stay behind the front card.
+    expect(button.style.zIndex).toBe('');
 
     fireEvent.blur(button);
     expect(screen.queryByTestId('node-glance')).not.toBeInTheDocument();

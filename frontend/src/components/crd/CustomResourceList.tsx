@@ -14,20 +14,19 @@
  * limitations under the License.
  */
 
-import { JSONPath } from 'jsonpath-plus';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router-dom';
 import { useSelectedClusters } from '../../lib/k8s';
 import CRD, { KubeCRD } from '../../lib/k8s/crd';
 import { KubeObject } from '../../lib/k8s/KubeObject';
-import { localeDate } from '../../lib/util';
 import { EmptyContent as Empty, Link, Loader, ResourceListView } from '../common';
 import {
   ColumnType,
   ResourceTableColumn,
   ResourceTableProps,
 } from '../common/Resource/ResourceTable';
+import { getPrinterColumnValue } from './printerColumnValue';
 
 export default function CustomResourceList() {
   const { t } = useTranslation(['glossary', 'translation']);
@@ -77,20 +76,6 @@ function CustomResourceLink(props: {
       {resource.metadata.name}
     </Link>
   );
-}
-
-function getValueWithJSONPath(item: { jsonData: object }, jsonPath: string): string {
-  let value: string | undefined;
-  try {
-    // Extract the value from the json item
-    value = JSONPath({ path: '$' + jsonPath, json: item.jsonData });
-  } catch (err) {
-    console.error(`Failed to get value from JSONPath ${jsonPath} on CR item ${item}`);
-  }
-
-  // Make sure the value will be represented in string form (to account for
-  // e.g. cases where we may get an array).
-  return value?.toString() || '';
 }
 
 export interface CustomResourceTableProps {
@@ -166,15 +151,13 @@ function CustomResourceTableInner(
       if (colSpec.jsonPath === '.metadata.creationTimestamp') {
         continue;
       }
+      // Hide additional printer columns with priority > 0 (matching kubectl get without -o wide).
+      if ((colSpec.priority ?? 0) > 0) {
+        continue;
+      }
       cols.push({
         label: colSpec.name,
-        getValue: resource => {
-          let value = getValueWithJSONPath(resource, colSpec.jsonPath);
-          if (colSpec.type === 'date') {
-            value = localeDate(new Date(value));
-          }
-          return value;
-        },
+        getValue: resource => getPrinterColumnValue(resource, colSpec),
       });
     }
     return cols;

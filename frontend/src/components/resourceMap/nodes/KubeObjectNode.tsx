@@ -20,6 +20,7 @@ import { styled } from '@mui/material/styles';
 import { alpha } from '@mui/system/colorManipulator';
 import { Handle, NodeProps, Position } from '@xyflow/react';
 import { memo, useEffect, useState } from 'react';
+import { useTypedSelector } from '../../../redux/hooks';
 import { Activity } from '../../activity/Activity';
 import { GraphNodeDetails } from '../details/GraphNodeDetails';
 import { getMainNode } from '../graph/graphGrouping';
@@ -57,15 +58,21 @@ const Container = styled('div')<{
   ':hover': {
     borderColor: isSelected ? undefined : alpha(theme.palette.action.active, 0.2),
     boxShadow: '4px 4px 6px rgba(0,0,0,0.06)',
-    zIndex: 10,
     '& .label-container': {
+      overflow: 'visible',
+    },
+    '& .node-title': {
+      WebkitLineClamp: 'unset',
       overflow: 'visible',
     },
   },
 
   ':focus-within': {
-    zIndex: 10,
     '& .label-container': {
+      overflow: 'visible',
+    },
+    '& .node-title': {
+      WebkitLineClamp: 'unset',
       overflow: 'visible',
     },
   },
@@ -148,6 +155,10 @@ const Subtitle = styled('div')({
 const Title = styled('div')({
   whiteSpace: 'normal',
   wordBreak: 'break-word',
+  display: '-webkit-box',
+  WebkitLineClamp: 2,
+  WebkitBoxOrient: 'vertical',
+  overflow: 'hidden',
 });
 
 const EXPAND_DELAY = 450;
@@ -158,6 +169,9 @@ export const KubeObjectNodeComponent = memo(({ id }: NodeProps) => {
   const [isExpanded, setIsExpanded] = useState(false);
   const theme = useTheme();
   const graph = useGraphView();
+  const drawerLocation = useTypedSelector(
+    state => state?.drawerMode?.detailsDrawerLocation ?? 'split-right'
+  );
 
   const mainNode = node?.nodes ? getMainNode(node.nodes) : undefined;
   const kubeObject = node?.kubeObject ?? mainNode?.kubeObject;
@@ -212,7 +226,8 @@ export const KubeObjectNodeComponent = memo(({ id }: NodeProps) => {
 
     Activity.launch({
       id: node.id,
-      location: 'split-right',
+      kind: 'details',
+      location: drawerLocation,
       temporary: true,
       cluster: node.kubeObject?.cluster,
       hideTitleInHeader: true,
@@ -240,7 +255,6 @@ export const KubeObjectNodeComponent = memo(({ id }: NodeProps) => {
       tabIndex={0}
       role="button"
       className={isExpanded ? 'kube-object-node--expanded' : undefined}
-      style={{ zIndex: isExpanded ? 10000 : undefined }}
       isFaded={false}
       childrenCount={node.nodes?.length ?? 0}
       isSelected={isSelected}
@@ -289,7 +303,7 @@ export const KubeObjectNodeComponent = memo(({ id }: NodeProps) => {
         {icon}
         <LabelContainer className="label-container" isCollapsed={isCollapsed}>
           <Subtitle>{subtitle}</Subtitle>
-          <Title>{label}</Title>
+          <Title className="node-title">{label}</Title>
         </LabelContainer>
       </TextContainer>
       {isExpanded && <NodeGlance node={node} />}

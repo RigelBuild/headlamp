@@ -119,3 +119,55 @@ export const JOB_RUNNING: KubeObjectInterface = {
     startTime: '2023-07-28T08:00:00Z',
   },
 };
+
+/**
+ * An Indexed Job that retries each index on its own. Indexes 1 and 3 used up their
+ * retries, and the Job stops when more than two indexes fail.
+ */
+export const JOB_INDEXED_WITH_FAILED_INDEXES: KubeObjectInterface = {
+  ...JOB_RUNNING,
+  metadata: {
+    ...JOB_RUNNING.metadata,
+    uid: 'job-indexed-uid',
+  },
+  spec: {
+    ...JOB_RUNNING.spec,
+    completions: 5,
+    parallelism: 2,
+    completionMode: 'Indexed',
+    backoffLimitPerIndex: 1,
+    maxFailedIndexes: 2,
+  },
+  status: {
+    active: 1,
+    succeeded: 2,
+    failed: 4,
+    startTime: '2023-07-28T08:00:00Z',
+    completedIndexes: '0,2',
+    failedIndexes: '1,3',
+  },
+};
+
+/** A Job that has been suspended. */
+export const JOB_SUSPENDED: KubeObjectInterface = {
+  ...JOB_RUNNING,
+  metadata: {
+    ...JOB_RUNNING.metadata,
+    uid: 'job-suspended-uid',
+  },
+  spec: {
+    ...JOB_RUNNING.spec,
+    suspend: true,
+  },
+  status: {
+    conditions: [
+      {
+        lastProbeTime: '2023-07-28T08:01:00Z',
+        lastTransitionTime: '2023-07-28T08:01:00Z',
+        status: 'True',
+        type: 'Suspended',
+      },
+    ],
+    startTime: '2023-07-28T08:00:00Z',
+  },
+};

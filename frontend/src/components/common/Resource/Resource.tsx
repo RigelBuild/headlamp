@@ -50,7 +50,7 @@ import Pod, { KubePod, KubeVolume } from '../../../lib/k8s/pod';
 import { METRIC_REFETCH_INTERVAL_MS, PodMetrics } from '../../../lib/k8s/PodMetrics';
 import Secret from '../../../lib/k8s/secret';
 import StatefulSet from '../../../lib/k8s/statefulSet';
-import { RouteURLProps } from '../../../lib/router';
+import type { RouteURLProps } from '../../../lib/router/createRouteURL';
 import { createRouteURL } from '../../../lib/router/createRouteURL';
 import { divideK8sResources } from '../../../lib/units';
 import { localeDate, useId } from '../../../lib/util';
@@ -67,14 +67,17 @@ import {
 import { JobsListRenderer } from '../../job/List';
 import { PodListProps, PodListRenderer } from '../../pod/List';
 import { StatefulSetsListRenderer } from '../../statefulset/List';
-import { LightTooltip, Loader, ObjectEventList } from '..';
 import BackLink from '../BackLink';
 import Empty from '../EmptyContent';
 import ErrorBoundary from '../ErrorBoundary';
 import InnerTable from '../InnerTable';
 import { DateLabel, HoverInfoLabel, StatusLabel, StatusLabelProps, ValueLabel } from '../Label';
 import Link, { LinkProps } from '../Link';
+import Loader from '../Loader';
+import ObjectEventList from '../ObjectEventList';
 import { useObjectEvents } from '../ObjectEventList';
+import PasswordForm from '../PasswordForm';
+import { LightTooltip } from '../Tooltip';
 import { metadataStyles } from '.';
 import A8RInfo from './A8RInfo';
 import { MainInfoSection, MainInfoSectionProps } from './MainInfoSection/MainInfoSection';
@@ -498,6 +501,7 @@ export interface DataFieldProps extends BaseTextFieldProps {
 
 export function DataField(props: DataFieldProps) {
   const { disableLabel, label, value, onSave, onChange } = props;
+  const { t } = useTranslation();
   // Make sure we reload after a theme change
   const theme = useTheme();
 
@@ -568,7 +572,7 @@ export function DataField(props: DataFieldProps) {
       {onSave && (
         <Box mt={1} display="flex" justifyContent="flex-end">
           <Button variant="contained" color="primary" onClick={() => onSave && onSave(data)}>
-            Save
+            {t('translation|Save')}
           </Button>
         </Box>
       )}
@@ -636,16 +640,18 @@ export function SecretField(props: SecretFieldProps) {
         </IconButton>
       </Grid>
       <Grid item xs>
-        <Input
-          aria-labelledby={nameID}
-          readOnly={!showPassword}
-          type="password"
-          fullWidth
-          multiline={showPassword}
-          maxRows="20"
-          value={showPassword ? Base64.decode(value as string) : '••••••••'}
-          {...other}
-        />
+        <PasswordForm>
+          <Input
+            aria-labelledby={nameID}
+            readOnly={!showPassword}
+            type="password"
+            fullWidth
+            multiline={showPassword}
+            maxRows="20"
+            value={showPassword ? Base64.decode(value as string) : '••••••••'}
+            {...other}
+          />
+        </PasswordForm>
       </Grid>
     </Grid>
   );
@@ -672,7 +678,7 @@ export function ConditionsTable(props: ConditionsTableProps) {
   function getColumns() {
     const cols: {
       label: string;
-      getter: (arg: KubeCondition) => void;
+      getter: (arg: KubeCondition) => React.ReactNode;
       hide?: boolean;
     }[] = [
       {
@@ -685,12 +691,21 @@ export function ConditionsTable(props: ConditionsTableProps) {
       },
       {
         label: t('Last Transition'),
-        getter: condition => <DateLabel date={condition.lastTransitionTime as string} />,
+        getter: condition =>
+          condition.lastTransitionTime ? (
+            <DateLabel date={condition.lastTransitionTime as string} />
+          ) : (
+            '-'
+          ),
       },
       {
         label: t('Last Update'),
         getter: condition =>
-          condition.lastUpdateTime ? <DateLabel date={condition.lastUpdateTime as string} /> : '-',
+          condition.lastUpdateTime !== null && condition.lastUpdateTime !== undefined ? (
+            <DateLabel date={condition.lastUpdateTime} />
+          ) : (
+            '-'
+          ),
         hide: !showLastUpdate,
       },
       {
@@ -754,14 +769,16 @@ interface FetchedResource {
  * Extracts all environment variable references from a container spec.
  * This is a pure function with no hooks.
  */
-function extractEnvVarReferences(container: KubeContainer): EnvVarReference[] {
+export function extractEnvVarReferences(container: KubeContainer): EnvVarReference[] {
   const refs: EnvVarReference[] = [];
 
   // Process env variables
   container?.env?.forEach(item => {
-    if (item.value) {
-      refs.push({ name: item.name, type: 'value', value: item.value });
-    } else if (item.valueFrom) {
+    // Without valueFrom an env var is a plain value, and that value can be empty. The API leaves
+    // out an empty value, so a missing one is an empty string as well.
+    if (!item.valueFrom) {
+      refs.push({ name: item.name, type: 'value', value: item.value ?? '' });
+    } else {
       const vf = item.valueFrom;
       if (vf.secretKeyRef) {
         refs.push({
@@ -868,7 +885,7 @@ function ConfigMapFetcher(props: {
  * Builds environment variables from references and fetched resources.
  * This is a pure function with no hooks.
  */
-function buildEnvironmentVariables(
+export function buildEnvironmentVariables(
   references: EnvVarReference[],
   fetchedSecrets: Map<string, FetchedResource>,
   fetchedConfigMaps: Map<string, FetchedResource>,
@@ -912,7 +929,7 @@ function buildEnvironmentVariables(
           });
         } else if (secret) {
           const secretData = (secret as any).data || {};
-          const value = secretData[ref.key!] ? atob(secretData[ref.key!]) : '';
+          const value = secretData[ref.key!] ? Base64.decode(secretData[ref.key!]) : '';
           variables.set(ref.name, {
             value,
             from: secret,
@@ -971,7 +988,7 @@ function buildEnvironmentVariables(
           const outOfSync = isOutOfSync(secret.metadata?.creationTimestamp);
           Object.entries(secretData).forEach(([key, value]) => {
             variables.set(`${prefix}${key}`, {
-              value: atob(value as string),
+              value: value ? Base64.decode(value as string) : '',
               from: secret,
               isError: false,
               isSecret: true,
@@ -2073,6 +2090,8 @@ export function ConditionsSection(props: { resource: KubeObjectInterface | null 
 
 export interface VolumeSectionProps {
   resource: KubeObjectInterface | null;
+  /** Cluster the resource belongs to, so volume links open in that cluster. */
+  cluster?: string;
 }
 
 export interface VolumeRowsProps {
@@ -2092,7 +2111,7 @@ export interface VolumePrints {
 
 export function VolumeSection(props: VolumeSectionProps) {
   const { t } = useTranslation('glossary');
-  const { resource } = props;
+  const { resource, cluster } = props;
   const volumes = resource?.spec?.volumes;
 
   if (!volumes) {
@@ -2129,6 +2148,7 @@ export function VolumeSection(props: VolumeSectionProps) {
               <Link
                 routeName={volumeRoute}
                 params={{ namespace: volumeNamespace, name: detailName }}
+                activeCluster={cluster}
               >
                 {volumeName}
               </Link>

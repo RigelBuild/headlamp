@@ -94,7 +94,8 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          build-args: HEADLAMP_GIT_VERSION=${{ github.sha }}
+          build-args: |
+            HEADLAMP_SOURCE_COMMIT=${{ github.sha }}
           platforms: linux/amd64,linux/arm64
           provenance: mode=max
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
@@ -115,7 +116,8 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          build-args: HEADLAMP_GIT_VERSION=${{ github.sha }}
+          build-args: |
+            HEADLAMP_SOURCE_COMMIT=${{ github.sha }}
           platforms: linux/amd64,linux/arm64
           push: false
           provenance: mode=max

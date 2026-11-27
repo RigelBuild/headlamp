@@ -109,6 +109,10 @@ function containerSeverity(reason?: string, exitCode?: number): AlertColor {
     return 'error';
   }
 
+  if (reason && /schedulinggated/i.test(reason)) {
+    return 'info';
+  }
+
   return 'warning';
 }
 
@@ -201,11 +205,29 @@ const REDUNDANT_CONDITION_REASONS = [
   'ContainersNotInitialized',
   'PodFailed',
   'PodCompleted',
+  'SchedulingGated',
 ];
 
 /**
- * Returns conditions whose status is 'False' or 'Unknown', excluding ones whose
- * reason only restates the pod/container failure. Conditions are skipped
+ * Condition types where a status of 'True' represents a failure (negative polarity),
+ * as opposed to positive conditions (e.g. Ready, Available, Progressing, PodScheduled)
+ * where 'True' indicates normal/healthy operation.
+ */
+const NEGATIVE_FAILURE_CONDITIONS = ['ReplicaFailure'];
+
+function isConditionFailing(condition: KubeCondition): boolean {
+  if (condition.status === 'Unknown') {
+    return true;
+  }
+  if (NEGATIVE_FAILURE_CONDITIONS.includes(condition.type)) {
+    return condition.status === 'True';
+  }
+  return condition.status === 'False';
+}
+
+/**
+ * Returns conditions whose status represents a failure or warning state, excluding
+ * ones whose reason only restates the pod/container failure. Conditions are skipped
  * entirely when the pod phase is 'Succeeded'.
  */
 function getFailedConditions(conditions: KubeCondition[] = [], phase?: string) {
@@ -215,8 +237,7 @@ function getFailedConditions(conditions: KubeCondition[] = [], phase?: string) {
 
   return conditions.filter(
     condition =>
-      ['False', 'Unknown'].includes(condition.status) &&
-      !REDUNDANT_CONDITION_REASONS.includes(condition.reason || '')
+      isConditionFailing(condition) && !REDUNDANT_CONDITION_REASONS.includes(condition.reason || '')
   );
 }
 
@@ -452,6 +473,9 @@ function diagnosisHint(reason: string | undefined, t: Translate): string | undef
       'The pod was evicted due to node resource pressure. Check node conditions and set resource requests and limits.'
     );
   }
+  if (r.includes('schedulinggated')) {
+    return t('Waiting for scheduling gates to be removed.');
+  }
   if (r.includes('unschedulable')) {
     return t(
       'The scheduler could not place the pod. Check node resources, taints and tolerations, and affinity rules.'
@@ -476,19 +500,32 @@ export function getPodDiagnostics(
   const warningEvents = sortWarningEvents(events);
 
   if (!podHealthy) {
+    const scheduledCondition = pod.status?.conditions?.find(
+      condition => condition.type === 'PodScheduled'
+    );
+    const isSchedulingGated = scheduledCondition?.reason === 'SchedulingGated';
+    const effectiveReason =
+      details.reason === 'Pending' && isSchedulingGated ? 'SchedulingGated' : details.reason;
+    const schedulingGates = ((pod.spec as any)?.schedulingGates || [])
+      .map((g: any) => g?.name)
+      .filter(Boolean);
+
     diagnostics.push({
       id: 'pod-status',
-      severity: containerSeverity(details.reason, pod.status?.phase === 'Failed' ? 1 : undefined),
+      severity: containerSeverity(effectiveReason, pod.status?.phase === 'Failed' ? 1 : undefined),
       title: t('Pod status: {{ status }}', {
-        status: details.reason || pod.status?.phase || t('Unknown'),
+        status: effectiveReason || pod.status?.phase || t('Unknown'),
       }),
       message:
-        [details.message || pod.status?.message, diagnosisHint(details.reason, t)]
+        [details.message || pod.status?.message, diagnosisHint(effectiveReason, t)]
           .filter(Boolean)
           .join(' ') ||
         t('Review the container logs and the warning events below to find the cause.'),
       details: [
         t('Phase: {{ phase }}', { phase: pod.status?.phase || t('Unknown') }),
+        schedulingGates.length
+          ? t('Scheduling gates: {{ gates }}', { gates: schedulingGates.join(', ') })
+          : '',
         details.totalContainers
           ? t('Ready containers: {{ ready }}/{{ total }}', {
               ready: details.readyContainers,
@@ -536,6 +573,9 @@ function getPodDominantReason(pod: PodLike) {
   );
 
   if (scheduledCondition?.status !== undefined && scheduledCondition.status !== 'True') {
+    if (scheduledCondition.reason === 'SchedulingGated') {
+      return 'SchedulingGated';
+    }
     return 'Unschedulable';
   }
 
@@ -654,7 +694,12 @@ export function getWorkloadDiagnostics(
   )) {
     const count = podsForReason.length;
     let title: string;
-    if (reason === 'Unschedulable') {
+    if (reason === 'SchedulingGated') {
+      title =
+        count === 1
+          ? t('{{ podCount }} pod is waiting for scheduling gates', { podCount: count })
+          : t('{{ podCount }} pods are waiting for scheduling gates', { podCount: count });
+    } else if (reason === 'Unschedulable') {
       title =
         count === 1
           ? t('{{ podCount }} pod is unschedulable', { podCount: count })

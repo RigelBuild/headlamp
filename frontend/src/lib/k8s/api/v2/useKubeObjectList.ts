@@ -18,6 +18,7 @@ import type { QueryObserverOptions } from '@tanstack/react-query';
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  getDiscoveredNamespaces,
   hasAllowedNamespacesRestriction,
   loadClusterSettings,
 } from '../../../../helpers/clusterSettings';
@@ -45,6 +46,7 @@ export function getWebsocketMultiplexerEnabled(): boolean {
 
 /** Default page size for list consumers that opt in to pagination. */
 export const DEFAULT_LIST_LIMIT = 1000;
+const DISCOVERED_NAMESPACE_REFRESH_MS = 60 * 1000;
 
 function toPaginationApiError(error: unknown, cluster: string, namespace?: string): ApiError {
   const apiError =
@@ -82,6 +84,107 @@ export interface ListResponse<K extends KubeObject> {
  * @param refetchInterval - Optional query refetch interval.
  * @returns Query options for the synthesized restricted Namespace list.
  */
+/**
+ * Checks labels against a Kubernetes label selector string, supporting
+ * equality-based (`k=v`, `k==v`, `k!=v`) and set-based (`k in (a,b)`,
+ * `k notin (a,b)`, `k`, `!k`) requirements separated by commas.
+ *
+ * @param selector - The label selector, e.g. "team=frontend,env in (dev,test)".
+ * @param labels - The labels of the object.
+ * @returns Whether every requirement matches.
+ */
+export function matchesLabelSelectorString(
+  selector: string,
+  labels: Record<string, string> = {}
+): boolean {
+  const requirements: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const char of selector) {
+    if (char === '(') depth++;
+    if (char === ')') depth--;
+    if (char === ',' && depth === 0) {
+      requirements.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  requirements.push(current);
+
+  const has = (key: string) => Object.prototype.hasOwnProperty.call(labels, key);
+
+  return requirements
+    .map(requirement => requirement.trim())
+    .filter(Boolean)
+    .every(requirement => {
+      let match = requirement.match(/^([^\s!=]+)\s+(in|notin)\s*\((.*)\)$/);
+      if (match) {
+        const values = match[3].split(',').map(value => value.trim());
+        const inSet = has(match[1]) && values.includes(labels[match[1]]);
+        return match[2] === 'in' ? inSet : !inSet;
+      }
+      match = requirement.match(/^([^\s!=]+)\s*!=\s*(.*)$/);
+      if (match) {
+        return labels[match[1]] !== match[2].trim();
+      }
+      match = requirement.match(/^([^\s!=]+)\s*==?\s*(.*)$/);
+      if (match) {
+        return has(match[1]) && labels[match[1]] === match[2].trim();
+      }
+      match = requirement.match(/^!\s*(\S+)$/);
+      if (match) {
+        return !has(match[1]);
+      }
+      return has(requirement);
+    });
+}
+
+/**
+ * Loads a namespace the user was found to have access to. Discovery does not
+ * guarantee "get namespaces": a namespace that is forbidden or gone is left out
+ * of the Namespace list instead of failing it (it still restricts list
+ * routing and the namespace filter, which only need the name).
+ *
+ * @param kubeObjectClass - The Namespace class.
+ * @param cluster - The cluster name.
+ * @param name - The namespace name.
+ * @param requestedSelector - The label selector of the request, if any.
+ * @returns The namespace object, or null when it is not readable or does not
+ *          match the selector.
+ */
+async function discoveredNamespaceObject<K extends KubeObject>(
+  kubeObjectClass: KubeObjectClass,
+  cluster: string,
+  name: string,
+  requestedSelector?: string
+): Promise<K | null> {
+  let item: any;
+  try {
+    item = await clusterFetch(makeUrl(['api', 'v1', 'namespaces', name]), { cluster }).then(
+      response => response.json()
+    );
+    if (item.metadata?.managedFields) {
+      delete item.metadata.managedFields;
+    }
+  } catch (error) {
+    if (!(error instanceof ApiError) || ![403, 404].includes(error.status ?? 0)) {
+      if (error instanceof ApiError) {
+        error.cluster = cluster;
+        error.namespace = name;
+      }
+      throw error;
+    }
+    return null;
+  }
+  if (requestedSelector && !matchesLabelSelectorString(requestedSelector, item.metadata?.labels)) {
+    return null;
+  }
+  const kubeObject = new kubeObjectClass(item) as K;
+  kubeObject.cluster = cluster;
+  return kubeObject;
+}
+
 function allowedNamespaceListQuery<K extends KubeObject>(
   kubeObjectClass: KubeObjectClass,
   cluster: string,
@@ -93,10 +196,20 @@ function allowedNamespaceListQuery<K extends KubeObject>(
   const configuredSelector = settings.allowedNamespacesSelector?.trim();
   const requestedSelector = queryParams.labelSelector?.trim();
   const selector = [configuredSelector, requestedSelector].filter(Boolean).join(',');
+  // Discovered namespaces only apply when nothing is configured (settings win).
+  const discoveredNamespaces =
+    allowedNamespaces.length === 0 && !configuredSelector
+      ? getDiscoveredNamespaces(cluster) ?? []
+      : [];
+  const discoveryRestricted =
+    allowedNamespaces.length === 0 &&
+    !configuredSelector &&
+    getDiscoveredNamespaces(cluster) !== undefined;
 
   return {
     placeholderData: null,
-    refetchInterval,
+    refetchInterval:
+      refetchInterval ?? (discoveryRestricted ? DISCOVERED_NAMESPACE_REFRESH_MS : undefined),
     retry: kubeRequestRetry,
     queryKey: [
       'kubeObject',
@@ -105,10 +218,10 @@ function allowedNamespaceListQuery<K extends KubeObject>(
       kubeObjectClass.apiName,
       cluster,
       '',
-      { allowedNamespaces, selector },
+      { allowedNamespaces, selector, discoveredNamespaces },
     ],
     queryFn: async () => {
-      const [manualItems, selectorList] = await Promise.all([
+      const [manualItems, selectorList, discoveredItems] = await Promise.all([
         Promise.all(
           allowedNamespaces.map(async name => {
             try {
@@ -142,6 +255,11 @@ function allowedNamespaceListQuery<K extends KubeObject>(
                 throw error;
               })
           : Promise.resolve(null),
+        Promise.all(
+          discoveredNamespaces.map(name =>
+            discoveredNamespaceObject<K>(kubeObjectClass, cluster, name, requestedSelector)
+          )
+        ).then(items => items.filter((item): item is Awaited<K> => item !== null)),
       ]);
 
       const selectorItems = (selectorList?.items ?? []).map((item: any) => {
@@ -154,7 +272,7 @@ function allowedNamespaceListQuery<K extends KubeObject>(
         kubeObject.cluster = cluster;
         return kubeObject;
       });
-      const items = [...manualItems, ...selectorItems].filter(
+      const items = [...manualItems, ...selectorItems, ...discoveredItems].filter(
         (item, index, allItems) =>
           allItems.findIndex(
             candidate => candidate.jsonData.metadata.name === item.jsonData.metadata.name
@@ -191,7 +309,8 @@ export function kubeObjectListQuery<K extends KubeObject>(
   namespace: string | undefined = '',
   cluster: string,
   queryParams: QueryParameters,
-  refetchInterval?: number
+  refetchInterval?: number,
+  asTable = false
 ): QueryObserverOptions<ListResponse<K> | undefined | null, ApiError> {
   const configuredSelector =
     loadClusterSettings(cluster).allowedNamespacesSelector?.trim() || undefined;
@@ -218,18 +337,64 @@ export function kubeObjectListQuery<K extends KubeObject>(
       cluster,
       namespace,
       queryParams,
+      ...(asTable ? ['Table'] : []),
     ],
     queryFn: async () => {
       // If no valid endpoint is passed, don't make the request
       if (!endpoint) return;
 
       try {
-        const list: KubeList<any> = await clusterFetch(
+        const requestTable =
+          asTable && kubeObjectClass.kind === 'Secret' && endpoint.resource === 'secrets';
+        const fetchResponse = await clusterFetch(
           makeUrl([KubeObjectEndpoint.toUrl(endpoint!, namespace)], queryParams),
           {
             cluster,
+            ...(requestTable && {
+              headers: {
+                Accept: 'application/json;as=Table;g=meta.k8s.io;v=v1,application/json;q=0.9',
+              },
+            }),
           }
-        ).then(it => it.json());
+        );
+        const result: any = await fetchResponse.json();
+        let list: KubeList<any> = result;
+        if (requestTable && result.kind === 'Table') {
+          // Table rows carry metadata and printable Type/Data cells, not secret values.
+          // The Accept header lets servers without Table support return an ordinary SecretList.
+          const typeIndex =
+            result.columnDefinitions?.findIndex((col: { name: string }) => col.name === 'Type') ??
+            -1;
+          const dataIndex =
+            result.columnDefinitions?.findIndex((col: { name: string }) => col.name === 'Data') ??
+            -1;
+          if (
+            typeIndex < 0 ||
+            dataIndex < 0 ||
+            !Array.isArray(result.rows) ||
+            result.rows.some(
+              (row: any) =>
+                !row.object?.metadata ||
+                typeof row.cells?.[typeIndex] !== 'string' ||
+                !Number.isInteger(Number(row.cells?.[dataIndex]))
+            )
+          ) {
+            throw new ApiError('Secret Table response lacks expected columns or metadata');
+          }
+          list = {
+            kind: 'SecretList',
+            apiVersion: 'v1',
+            metadata: result.metadata,
+            items: result.rows.map((row: any) => ({
+              apiVersion: 'v1',
+              kind: 'Secret',
+              metadata: row.object.metadata,
+              type: row.cells[typeIndex],
+              dataCount: Number(row.cells[dataIndex]),
+              data: {},
+            })),
+          };
+        }
         const kind = list.kind.replace(/List$/, '');
         const apiVersion = list.apiVersion;
         list.items = list.items.map(item => {
@@ -402,6 +567,13 @@ function useWatchKubeObjectListsMultiplexed<K extends KubeObject>({
         cluster,
         stableQueryParams ?? {}
       ).queryKey;
+
+      // The watch's resource version expired, so it cannot report what changed since, such
+      // as deletions. List again to replace the cached list; the watch then resumes from it.
+      if (update.type === 'ERROR' && update.object?.code === 410) {
+        client.invalidateQueries({ queryKey });
+        return;
+      }
 
       // Update React Query cache with new data
       client.setQueryData(queryKey, (oldResponse: ListResponse<any> | undefined | null) => {
@@ -624,6 +796,29 @@ function flattenListRequests(
   );
 }
 
+/**
+ * Whether a currently-watched list is still covered by one of the given requests.
+ *
+ * An empty-string namespace is a real, valid value: it means "all namespaces" for a
+ * namespaced resource, and it is what a request with no namespace filter produces.
+ * Because it is falsy, matching it against a request's namespace list needs an
+ * explicit undefined check rather than a truthiness check, or the watch entry is
+ * dropped every render and immediately re-added, looping setState (see 9542b5cb5).
+ * The unfiltered branch keeps the falsy check on purpose, so a watch on '' still
+ * matches a request that asks for no particular namespace.
+ */
+export function isWatchedListStillRequested(
+  watching: { cluster: string; namespace?: string },
+  requests: Array<{ cluster: string; namespaces?: string[] }>
+): boolean {
+  return requests.some(request => {
+    if (watching.cluster !== request?.cluster) return false;
+    return !request.namespaces?.length
+      ? !watching.namespace
+      : watching.namespace !== undefined && request.namespaces.includes(watching.namespace);
+  });
+}
+
 function getPositiveLimit(queryParams: QueryParameters): number | undefined {
   const limit = Number(queryParams.limit);
 
@@ -663,6 +858,7 @@ export function useKubeObjectList<K extends KubeObject>({
   queryParams,
   watch = true,
   refetchInterval,
+  asTable = false,
   emptyWhenNoRequests = false,
 }: {
   requests: Array<{ cluster: string; namespaces?: string[] }>;
@@ -673,18 +869,32 @@ export function useKubeObjectList<K extends KubeObject>({
   watch?: boolean;
   /** How often to refetch the list. Won't refetch by default. Disables watching if set. */
   refetchInterval?: number;
+  /** Request a compact Kubernetes Table for this list only. */
+  asTable?: boolean;
   /** Return an empty list instead of a loading state when requests were intentionally suppressed. */
   emptyWhenNoRequests?: boolean;
 }): [Array<K> | null, ApiError | null] &
-  QueryListResponse<Array<ListResponse<K> | undefined | null>, K, ApiError> {
-  const maybeNamespace = requests.find(it => it.namespaces)?.namespaces?.[0];
+  QueryListResponse<Array<ListResponse<K> | undefined | null>, K, ApiError> & {
+    /** Oldest successful query update in the combined list, or zero while unresolved. */
+    dataUpdatedAt: number;
+  } {
+  const candidateNamespaces = useMemo(
+    () => [
+      ...new Set(
+        requests
+          .filter(it => it.cluster === requests[0]?.cluster)
+          .flatMap(it => it.namespaces ?? [])
+      ),
+    ],
+    [requests]
+  );
 
   // Get working endpoint from the first cluster
   // Now if clusters have different apiVersions for the same resource for example, this will not work
   const { endpoint, error: endpointError } = useEndpoints(
     requests.length === 0 ? [] : kubeObjectClass.apiEndpoint.apiInfo,
     requests[0]?.cluster,
-    maybeNamespace
+    candidateNamespaces
   );
 
   const cleanedUpQueryParams = Object.fromEntries(
@@ -718,12 +928,13 @@ export function useKubeObjectList<K extends KubeObject>({
               namespace,
               cluster,
               perRequestQueryParams,
-              refetchInterval
+              refetchInterval,
+              asTable
             )
           )
         : [],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [activeListRequests, kubeObjectClass, endpoint, perRequestQueryParams]
+    [activeListRequests, kubeObjectClass, endpoint, perRequestQueryParams, refetchInterval, asTable]
   );
 
   const query = useQueries({
@@ -737,24 +948,54 @@ export function useKubeObjectList<K extends KubeObject>({
           result.data.list.metadata.remainingItemCount === undefined
       );
 
+      // A cluster gets one request per allowed namespace, so group the results by cluster and
+      // combine them, instead of letting the last namespace replace the others. Every request
+      // counts, also the ones still loading or failed. A request still loading shows its
+      // placeholder data, which React Query reports as a success, so isPlaceholderData is what
+      // marks it as loading.
+      const resultsByCluster: Record<string, typeof results> = {};
+      results.forEach((result, index) => {
+        const cluster = activeListRequests[index]?.cluster;
+        if (cluster) {
+          (resultsByCluster[cluster] ??= []).push(result);
+        }
+      });
+      const clusterResults: Record<string, QueryListResponse<any, K, ApiError>> = {};
+      Object.entries(resultsByCluster).forEach(([cluster, clusterQueryResults]) => {
+        const withData = clusterQueryResults.filter(result => result.data);
+        // A cluster only gets an entry once one of its namespaces has data, as before.
+        if (withData.length === 0) {
+          return;
+        }
+        const errors = clusterQueryResults
+          .map(result => result.error)
+          .filter((error): error is ApiError => !!error);
+        const isError = clusterQueryResults.some(result => result.isError);
+        const isSuccess = clusterQueryResults.every(
+          result => result.isSuccess && !result.isPlaceholderData
+        );
+        clusterResults[cluster] = {
+          data: withData[0].data,
+          error: errors[0] ?? null,
+          errors: errors.length > 0 ? errors : null,
+          isError,
+          isFetching: clusterQueryResults.some(result => result.isFetching),
+          isLoading: clusterQueryResults.some(
+            result => result.isLoading || result.isPlaceholderData
+          ),
+          isSuccess,
+          items: withData.flatMap(result => result.data?.list?.items ?? []),
+          status: isError ? 'error' : isSuccess ? 'success' : 'pending',
+        };
+      });
+
       return {
         data: results.map(result => result.data),
-        clusterResults: results.reduce((acc, result) => {
-          if (result.data && result.data.cluster) {
-            acc[result.data.cluster] = {
-              data: result.data,
-              error: result.error,
-              errors: result.error ? [result.error] : null,
-              isError: result.isError,
-              isFetching: result.isFetching,
-              isLoading: result.isLoading,
-              isSuccess: result.isSuccess,
-              items: result?.data?.list?.items ?? null,
-              status: result.status,
-            };
-          }
-          return acc;
-        }, {} as Record<string, QueryListResponse<any, K, ApiError>>),
+        dataUpdatedAt: results.reduce(
+          (oldest, result) => Math.min(oldest, result.dataUpdatedAt),
+          results[0]?.dataUpdatedAt ?? 0
+        ),
+        clusterResults,
         items:
           emptyWhenNoRequests && results.length === 0
             ? []
@@ -781,7 +1022,7 @@ export function useKubeObjectList<K extends KubeObject>({
 
   // Don't watch when results are paginated — the watch stream would deliver events
   // for resources outside our fetched page, causing the list to grow unboundedly.
-  const shouldWatch = watch && !refetchInterval && !query.isLoading && !query.hasMore;
+  const shouldWatch = watch && !asTable && !refetchInterval && !query.isLoading && !query.hasMore;
 
   const [listsToWatch, setListsToWatch] = useState<
     { cluster: string; namespace?: string; resourceVersion: string }[]
@@ -789,14 +1030,8 @@ export function useKubeObjectList<K extends KubeObject>({
 
   useEffect(() => {
     setListsToWatch(currentListsToWatch => {
-      const keptListsToWatch = currentListsToWatch.filter(
-        watching =>
-          requests.find(request => {
-            if (watching.cluster !== request?.cluster) return false;
-            return !request.namespaces?.length
-              ? !watching.namespace
-              : !!watching.namespace && request.namespaces.includes(watching.namespace);
-          }) !== undefined
+      const keptListsToWatch = currentListsToWatch.filter(watching =>
+        isWatchedListStillRequested(watching, requests)
       );
 
       if (!shouldWatch) {
@@ -875,7 +1110,8 @@ export function useKubeObjectList<K extends KubeObject>({
             namespace,
             cluster,
             perRequestQueryParams,
-            refetchInterval
+            refetchInterval,
+            asTable
           )
         );
 
@@ -914,12 +1150,22 @@ export function useKubeObjectList<K extends KubeObject>({
             ...perRequestQueryParams,
             continue: continueToken,
           };
-          let raw: KubeList<any>;
+          let page: ListResponse<K>;
           try {
-            raw = await clusterFetch(
-              makeUrl([KubeObjectEndpoint.toUrl(endpoint, cached.namespace)], fetchParams),
-              { cluster: cached.cluster }
-            ).then(r => r.json());
+            // Reuse the first-page query's Table conversion for paginated Secret lists.
+            const pageQueryFn = kubeObjectListQuery<K>(
+              kubeObjectClass,
+              endpoint,
+              cached.namespace,
+              cached.cluster,
+              fetchParams,
+              refetchInterval,
+              asTable
+            ).queryFn;
+            if (typeof pageQueryFn !== 'function') {
+              throw new ApiError('Cannot load another page without a list query');
+            }
+            page = (await pageQueryFn({} as any))!;
           } catch (e) {
             const error =
               e instanceof ApiError
@@ -935,16 +1181,8 @@ export function useKubeObjectList<K extends KubeObject>({
             throw error;
           }
 
-          const kind = raw.kind.replace(/List$/, '');
-          const apiVersion = raw.apiVersion;
-          const newItems: K[] = raw.items.map((item: any) => {
-            if (item.metadata?.managedFields) delete item.metadata.managedFields;
-            item.kind = kind;
-            item.apiVersion = apiVersion;
-            const obj = new kubeObjectClass(item) as K;
-            obj.cluster = cached.cluster;
-            return obj;
-          });
+          const { list: raw } = page;
+          const newItems = raw.items;
 
           queryClient.setQueryData<ListResponse<K>>(q.queryKey!, old => {
             if (!old) return old;
@@ -990,11 +1228,13 @@ export function useKubeObjectList<K extends KubeObject>({
     kubeObjectClass,
     perRequestQueryParams,
     refetchInterval,
+    asTable,
   ]);
 
   // @ts-ignore - TS compiler gets confused with iterators
   return {
     items: endpointError ? [] : query.items,
+    dataUpdatedAt: query.dataUpdatedAt,
     errors: endpointError ? [endpointError] : errors.length > 0 ? errors : null,
     error: endpointError ?? paginationError ?? query.errors.find(it => it !== null) ?? null,
     clusterResults: query.clusterResults,

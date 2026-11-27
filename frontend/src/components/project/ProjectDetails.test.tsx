@@ -39,6 +39,26 @@ const { MockKubeObject } = vi.hoisted(() => {
 
 vi.mock('../../lib/k8s/KubeObject', () => ({ KubeObject: MockKubeObject }));
 vi.mock('./ProjectDeleteButton', () => ({ ProjectDeleteButton: () => null }));
+
+const { lastResourceTablePropsListHolder } = vi.hoisted(() => ({
+  lastResourceTablePropsListHolder: { current: [] as any[] },
+}));
+
+vi.mock('../common/Resource/ResourceTable', () => ({
+  default: (props: any) => {
+    lastResourceTablePropsListHolder.current.push(props);
+    return null;
+  },
+}));
+
+// The Access tab lists Roles and RoleBindings via their resource classes' useList hook,
+// so stub those hooks out (the tables themselves are mocked above).
+vi.mock('../../lib/k8s/role', () => ({
+  default: { useList: () => ({ items: [], errors: null }), pluralName: 'roles' },
+}));
+vi.mock('../../lib/k8s/roleBinding', () => ({
+  default: { useList: () => ({ items: [], errors: null }), pluralName: 'rolebindings' },
+}));
 const eventProject = {
   id: 'project-1',
   namespaces: ['ns1'],
@@ -366,6 +386,74 @@ describe('ProjectDetails overview sections', () => {
   });
 });
 
+describe('ProjectDetails tabs', () => {
+  beforeEach(() => {
+    vi.mocked(useProjectItems).mockReturnValue({ items: [], errors: [], isLoading: false });
+  });
+
+  it('ignores a stale tab-enablement result after the registered tabs change', async () => {
+    // ProjectDetails (the route-level wrapper) remounts ProjectDetailsContent
+    // via a `key` whenever the project name changes, so switching projects
+    // isn't a same-instance trigger for the loadTabs effect. Re-registering a
+    // details tab (e.g. a plugin updating its tab definition) while staying
+    // on the same project is: it changes the `registeredTabs` Redux state
+    // that the SAME mounted ProjectDetailsContent instance reads, without
+    // any remount.
+    let resolveStaleCheck: (enabled: boolean) => void = () => {};
+    const staleIsEnabled = vi.fn(
+      () =>
+        new Promise<boolean>(resolve => {
+          resolveStaleCheck = resolve;
+        })
+    );
+    const freshIsEnabled = vi.fn().mockResolvedValue(true);
+
+    const store = configureStore({
+      reducer: reducers,
+      middleware: getDefaultMiddleware => getDefaultMiddleware({ serializableCheck: false }),
+    });
+
+    store.dispatch(
+      addDetailsTab({
+        id: 'project-specific-tab',
+        label: 'Stale project tab',
+        icon: 'mdi:view-dashboard',
+        component: () => <div>Stale tab content</div>,
+        isEnabled: staleIsEnabled,
+      })
+    );
+
+    render(
+      <TestContext store={store}>
+        <ProjectDetailsContent project={overviewProject} />
+      </TestContext>
+    );
+    await waitFor(() => expect(staleIsEnabled).toHaveBeenCalledWith({ project: overviewProject }));
+
+    // Re-register the same tab id with a new definition (same project, same
+    // component instance) — this is what should win.
+    act(() => {
+      store.dispatch(
+        addDetailsTab({
+          id: 'project-specific-tab',
+          label: 'Fresh project tab',
+          icon: 'mdi:view-dashboard',
+          component: () => <div>Fresh tab content</div>,
+          isEnabled: freshIsEnabled,
+        })
+      );
+    });
+    await waitFor(() => expect(screen.getByText('Fresh project tab')).toBeInTheDocument());
+
+    // Now resolve the stale check, after the fresh registration has already
+    // settled and rendered.
+    await act(async () => resolveStaleCheck(true));
+
+    expect(screen.queryByText('Stale project tab')).not.toBeInTheDocument();
+    expect(screen.getByText('Fresh project tab')).toBeInTheDocument();
+  });
+});
+
 describe('ProjectDetailsContent', () => {
   beforeEach(() => {
     vi.mocked(useProjectItems).mockReturnValue({ items: [], errors: [], isLoading: false });
@@ -504,5 +592,37 @@ describe('ProjectDetailsContent', () => {
     await act(async () => resolveEnablement(true));
 
     expect(screen.queryByRole('button', { name: 'Delayed action' })).not.toBeInTheDocument();
+  });
+});
+
+describe('ProjectDetails Access tab', () => {
+  beforeEach(() => {
+    vi.mocked(useProjectItems).mockReturnValue({ items: [], errors: [], isLoading: false });
+    lastResourceTablePropsListHolder.current = [];
+  });
+
+  it('renders the Role and RoleBinding tables with noNamespaceFilter set', async () => {
+    const accessProject: ProjectDefinition = {
+      id: 'project-access',
+      namespaces: ['ns-a', 'ns-b'],
+      clusters: ['test'],
+    };
+    const store = configureStore({
+      reducer: reducers,
+      middleware: getDefaultMiddleware => getDefaultMiddleware({ serializableCheck: false }),
+    });
+
+    render(
+      <TestContext store={store}>
+        <ProjectDetailsContent project={accessProject} />
+      </TestContext>
+    );
+
+    fireEvent.click(await screen.findByRole('tab', { name: /Access/ }));
+
+    await waitFor(() => expect(lastResourceTablePropsListHolder.current).toHaveLength(2));
+    expect(lastResourceTablePropsListHolder.current.every(props => props.noNamespaceFilter)).toBe(
+      true
+    );
   });
 });

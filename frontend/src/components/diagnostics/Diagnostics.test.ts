@@ -205,4 +205,199 @@ describe('diagnostics helpers', () => {
       ])
     );
   });
+
+  it('surfaces ReplicaFailure=True controller condition when ReplicaSet is blocked by quota with no pods', () => {
+    const replicaSet = {
+      kind: 'ReplicaSet',
+      metadata: {
+        name: 'quota-blocked',
+        namespace: 'headlamp-diagnostics-repro',
+      },
+      spec: {
+        replicas: 1,
+      },
+      status: {
+        replicas: 0,
+        observedGeneration: 1,
+        conditions: [
+          {
+            type: 'ReplicaFailure',
+            status: 'True',
+            reason: 'FailedCreate',
+            message:
+              'pods "quota-blocked-hqj5l" is forbidden: exceeded quota: no-pods, requested: pods=1, used: pods=0, limited: pods=0',
+          },
+        ],
+      },
+    } as any;
+
+    const diagnostics = getWorkloadDiagnostics(replicaSet, []);
+
+    const failureItem = diagnostics.find(item => item.id === 'workload-condition-ReplicaFailure');
+    expect(failureItem).toBeDefined();
+    expect(failureItem?.severity).toBe('error');
+    expect(failureItem?.title).toBe('ReplicaSet condition ReplicaFailure is True');
+    expect(failureItem?.message).toBe(
+      'pods "quota-blocked-hqj5l" is forbidden: exceeded quota: no-pods, requested: pods=1, used: pods=0, limited: pods=0'
+    );
+    expect(failureItem?.details).toEqual(['Reason: FailedCreate']);
+  });
+
+  it('surfaces ReplicaFailure=True condition for Deployments', () => {
+    const deployment = {
+      kind: 'Deployment',
+      metadata: { name: 'web-deploy', namespace: 'default' },
+      spec: { replicas: 2 },
+      status: {
+        replicas: 0,
+        conditions: [
+          {
+            type: 'ReplicaFailure',
+            status: 'True',
+            reason: 'FailedCreate',
+            message: 'Cannot create pods',
+          },
+        ],
+      },
+    } as any;
+
+    const diagnostics = getWorkloadDiagnostics(deployment, []);
+    const failureItem = diagnostics.find(item => item.id === 'workload-condition-ReplicaFailure');
+    expect(failureItem).toBeDefined();
+    expect(failureItem?.severity).toBe('error');
+    expect(failureItem?.title).toBe('Deployment condition ReplicaFailure is True');
+    expect(failureItem?.message).toBe('Cannot create pods');
+  });
+
+  // Defensive semantics test: Kubernetes controllers typically remove ReplicaFailure
+  // upon recovery rather than keeping it with status=False, but if present False must
+  // never be flagged as a failure.
+  it('does not create a failure finding when ReplicaFailure is False', () => {
+    const replicaSet = {
+      kind: 'ReplicaSet',
+      metadata: { name: 'recovered-rs', namespace: 'default' },
+      spec: { replicas: 1 },
+      status: {
+        replicas: 1,
+        availableReplicas: 1,
+        readyReplicas: 1,
+        conditions: [
+          {
+            type: 'ReplicaFailure',
+            status: 'False',
+            reason: 'ReplicaSetCreateSuccessful',
+          },
+        ],
+      },
+    } as any;
+
+    const diagnostics = getWorkloadDiagnostics(replicaSet, []);
+    expect(diagnostics.some(item => item.id.includes('ReplicaFailure'))).toBe(false);
+  });
+
+  it.each([
+    { type: 'Available', status: 'True', expectedSeverity: null },
+    { type: 'Progressing', status: 'True', expectedSeverity: null },
+    { type: 'Available', status: 'False', expectedSeverity: 'error' },
+    { type: 'Progressing', status: 'False', expectedSeverity: 'error' },
+    { type: 'Available', status: 'Unknown', expectedSeverity: 'warning' },
+    { type: 'ReplicaFailure', status: 'Unknown', expectedSeverity: 'warning' },
+  ])(
+    'evaluates condition $type with status $status as severity $expectedSeverity',
+    ({ type, status, expectedSeverity }) => {
+      const workload = {
+        kind: 'Deployment',
+        metadata: { name: 'app', namespace: 'default' },
+        spec: { replicas: 1 },
+        status: {
+          replicas: 1,
+          availableReplicas: 1,
+          readyReplicas: 1,
+          conditions: [{ type, status, reason: 'TestReason', message: `Test message for ${type}` }],
+        },
+      } as any;
+
+      const diagnostics = getWorkloadDiagnostics(workload, []);
+      const conditionDiagnostic = diagnostics.find(
+        item => item.id === `workload-condition-${type}`
+      );
+
+      if (expectedSeverity === null) {
+        expect(conditionDiagnostic).toBeUndefined();
+      } else {
+        expect(conditionDiagnostic).toBeDefined();
+        expect(conditionDiagnostic?.severity).toBe(expectedSeverity);
+      }
+    }
+  );
+
+  it('handles SchedulingGated pods as info rather than critical failure', () => {
+    const pod = makePod({
+      getDetailedStatus: () => ({
+        reason: 'Pending',
+        message: '',
+        readyContainers: 0,
+        totalContainers: 1,
+        restarts: 0,
+      }),
+      spec: {
+        schedulingGates: [{ name: 'example.com/gate-1' }, { name: 'example.com/gate-2' }],
+      },
+      status: {
+        phase: 'Pending',
+        containerStatuses: [],
+        conditions: [
+          {
+            type: 'PodScheduled',
+            status: 'False',
+            reason: 'SchedulingGated',
+            message: 'Scheduling is blocked due to non-empty scheduling gates',
+          },
+        ],
+      },
+    });
+
+    const diagnostics = getPodDiagnostics(pod);
+
+    // PodScheduled condition must not be flagged as a critical failed condition
+    expect(diagnostics.some(item => item.id === 'condition-PodScheduled')).toBe(false);
+
+    const statusDiag = diagnostics.find(item => item.id === 'pod-status');
+    expect(statusDiag).toBeDefined();
+    expect(statusDiag?.severity).toBe('info');
+    expect(statusDiag?.title).toBe('Pod status: SchedulingGated');
+    expect(statusDiag?.message).toContain('Waiting for scheduling gates to be removed.');
+    expect(statusDiag?.details).toContain(
+      'Scheduling gates: example.com/gate-1, example.com/gate-2'
+    );
+  });
+
+  it('aggregates SchedulingGated pods under info severity in workload diagnostics', () => {
+    const workload = {
+      kind: 'Deployment',
+      metadata: { name: 'app', namespace: 'default' },
+      spec: { replicas: 2 },
+      status: { replicas: 2, availableReplicas: 0, readyReplicas: 0 },
+    } as any;
+
+    const gatedPod1 = makePod({
+      status: {
+        phase: 'Pending',
+        conditions: [{ type: 'PodScheduled', status: 'False', reason: 'SchedulingGated' }],
+      },
+    });
+    const gatedPod2 = makePod({
+      status: {
+        phase: 'Pending',
+        conditions: [{ type: 'PodScheduled', status: 'False', reason: 'SchedulingGated' }],
+      },
+    });
+
+    const diagnostics = getWorkloadDiagnostics(workload, [gatedPod1, gatedPod2]);
+    const gatedDiag = diagnostics.find(item => item.id === 'workload-pods-SchedulingGated');
+    expect(gatedDiag).toBeDefined();
+    expect(gatedDiag?.severity).toBe('info');
+    expect(gatedDiag?.title).toBe('2 pods are waiting for scheduling gates');
+    expect(gatedDiag?.message).toBe('Waiting for scheduling gates to be removed.');
+  });
 });

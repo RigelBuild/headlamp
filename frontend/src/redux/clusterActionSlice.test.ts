@@ -20,10 +20,34 @@ import clusterActionSliceReducer, {
   cancelClusterAction,
   CLUSTER_ACTION_GRACE_PERIOD,
   executeClusterAction,
+  splitK8sValidationErrors,
   updateClusterAction,
 } from './clusterActionSlice';
 
 vi.setConfig({ testTimeout: 10000 });
+
+describe('splitK8sValidationErrors', () => {
+  it.each([
+    'name\\',
+    'name\\\\',
+    'name"',
+    'name\\", spec.fake: value',
+    'name, spec.fake: value',
+    'name{[value]}',
+  ])('keeps quoted value %j intact and splits the next field', value => {
+    // Kubernetes field errors quote invalid string values with Go's %q.
+    const first = `metadata.name: Invalid value: ${JSON.stringify(value)}: invalid name`;
+    const second = 'spec.replicas: Invalid value: -1: must be greater than or equal to 0';
+    expect(splitK8sValidationErrors(`${first}, ${second}`)).toEqual([first, second]);
+  });
+
+  it('does not split nested Go struct fields or quoted commas', () => {
+    const first =
+      'spec.selector: Invalid value: v1.LabelSelector{MatchLabels:map[string]string{"x":"a, b"}, MatchExpressions:[]v1.LabelSelectorRequirement{}}: invalid';
+    const second = 'spec.template.metadata.labels: Required value';
+    expect(splitK8sValidationErrors(`${first}, ${second}`)).toEqual([first, second]);
+  });
+});
 
 function getStore() {
   const createActionTracker = () => {
@@ -350,6 +374,233 @@ describe('clusterActionSlice', () => {
       // And the result must contain exactly one bullet.
       const bulletCount = (msg.match(/•/g) ?? []).length;
       expect(bulletCount).toBe(1);
+    });
+  });
+
+  describe('action formatters and lifecycle', () => {
+    it('should use the error message formatter if provided', async () => {
+      const callback = vi.fn(() => {
+        throw new Error('Something went wrong');
+      });
+      const errorMessageFormatter = vi.fn((error: Error) => `Formatted: ${error.message}`);
+      const action: CallbackAction = {
+        callback,
+        errorMessageFormatter,
+        startMessage: 'Starting',
+        errorMessage: 'Error',
+      };
+      vi.useFakeTimers();
+      const dispatchedAction = store.dispatch(executeClusterAction(action));
+      vi.advanceTimersByTime(CLUSTER_ACTION_GRACE_PERIOD);
+      await dispatchedAction;
+      expect(store.getActions()).toContainEqual(
+        expect.objectContaining({
+          type: updateClusterAction.type,
+          payload: expect.objectContaining({ message: 'Formatted: Something went wrong' }),
+        })
+      );
+      expect(errorMessageFormatter).toHaveBeenCalled();
+    });
+
+    it('should fall back to the default error message if the formatter returns an empty string', async () => {
+      const callback = vi.fn(() => {
+        throw new Error('Something went wrong');
+      });
+      const errorMessageFormatter = vi.fn(() => '');
+      const action: CallbackAction = {
+        callback,
+        errorMessageFormatter,
+        startMessage: 'Starting',
+        errorMessage: 'Error',
+      };
+      vi.useFakeTimers();
+      const dispatchedAction = store.dispatch(executeClusterAction(action));
+      vi.advanceTimersByTime(CLUSTER_ACTION_GRACE_PERIOD);
+      await dispatchedAction;
+      expect(store.getActions()).toContainEqual(
+        expect.objectContaining({
+          type: updateClusterAction.type,
+          payload: expect.objectContaining({ message: 'Error. Something went wrong' }),
+        })
+      );
+      expect(errorMessageFormatter).toHaveBeenCalled();
+    });
+
+    it('should fall back to the default error message if the formatter throws', async () => {
+      const callback = vi.fn(() => {
+        throw new Error('Something went wrong');
+      });
+      const errorMessageFormatter = vi.fn(() => {
+        throw new Error('Formatter failed');
+      });
+      const action: CallbackAction = {
+        callback,
+        errorMessageFormatter,
+        startMessage: 'Starting',
+        errorMessage: 'Error',
+      };
+      vi.useFakeTimers();
+      const dispatchedAction = store.dispatch(executeClusterAction(action));
+      vi.advanceTimersByTime(CLUSTER_ACTION_GRACE_PERIOD);
+      await dispatchedAction;
+      expect(store.getActions()).toContainEqual(
+        expect.objectContaining({
+          type: updateClusterAction.type,
+          payload: expect.objectContaining({ message: 'Error. Something went wrong' }),
+        })
+      );
+      expect(errorMessageFormatter).toHaveBeenCalled();
+    });
+
+    it('should call lifecycle callbacks (onSuccess)', async () => {
+      const callback = vi.fn(() => Promise.resolve());
+      const onSuccess = vi.fn();
+      const action: CallbackAction = { callback, onSuccess, startMessage: 'Starting' };
+      vi.useFakeTimers();
+      const dispatchedAction = store.dispatch(executeClusterAction(action));
+      vi.advanceTimersByTime(CLUSTER_ACTION_GRACE_PERIOD);
+      await dispatchedAction;
+      expect(onSuccess).toHaveBeenCalled();
+    });
+
+    it('should call lifecycle callbacks (onError)', async () => {
+      const callback = vi.fn(() => {
+        throw new Error('Failed');
+      });
+      const onError = vi.fn();
+      const action: CallbackAction = { callback, onError, startMessage: 'Starting' };
+      vi.useFakeTimers();
+      const dispatchedAction = store.dispatch(executeClusterAction(action));
+      vi.advanceTimersByTime(CLUSTER_ACTION_GRACE_PERIOD);
+      await dispatchedAction;
+      expect(onError).toHaveBeenCalledWith(expect.any(Error));
+    });
+
+    it('should call lifecycle callbacks (onCancelled)', async () => {
+      const callback = vi.fn(() => Promise.resolve());
+      const onCancelled = vi.fn();
+      const action: CallbackAction = { callback, onCancelled, startMessage: 'Starting' };
+      vi.useFakeTimers();
+      const dispatchedAction = store.dispatch(executeClusterAction(action));
+      vi.advanceTimersByTime(CLUSTER_ACTION_GRACE_PERIOD / 2);
+      const actionKey = Object.keys(store.getState().clusterAction)[0];
+      store.dispatch(cancelClusterAction(actionKey));
+      await dispatchedAction;
+      expect(onCancelled).toHaveBeenCalled();
+    });
+
+    it.each(['empty', 'throw'] as const)(
+      'preserves validation cleaning and bullet formatting with a %s formatter',
+      async formatterResult => {
+        vi.useFakeTimers();
+        const formatter = vi.fn(() => {
+          if (formatterResult === 'throw') throw new Error('Formatter failed');
+          return '';
+        });
+        const dispatchedAction = store.dispatch(
+          executeClusterAction({
+            callback: () => {
+              throw new Error(
+                `Deployment.apps "myapp" is invalid: [metadata.labels: Invalid value: "bad val": invalid, ` +
+                  `regex used for validation is 'label-regex', spec.replicas: Invalid value: -1: must be positive]`
+              );
+            },
+            errorMessage: 'Failed to apply.',
+            errorMessageFormatter: formatter,
+          })
+        );
+        await vi.advanceTimersByTimeAsync(CLUSTER_ACTION_GRACE_PERIOD);
+        const result = await dispatchedAction;
+        expect(result.meta.requestStatus).toBe('fulfilled');
+        expect(Object.values(store.getState().clusterAction)[0]).toMatchObject({
+          state: 'error',
+          message:
+            'Failed to apply. Deployment.apps "myapp" is invalid:\n' +
+            '• metadata.labels: Invalid value: "bad val": invalid\n' +
+            '• spec.replicas: Invalid value: -1: must be positive',
+        });
+        expect(formatter).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    it.each([
+      ['success', false],
+      ['success', true],
+      ['error', false],
+      ['error', true],
+      ['cancel', false],
+      ['cancel', true],
+    ] as const)('keeps %s outcome exclusive when lifecycle throws=%s', async (outcome, throws) => {
+      vi.useFakeTimers();
+      const callbackError = new Error('Backend failed');
+      const lifecycleError = new Error('Lifecycle failed');
+      const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const observed: string[] = [];
+        const lifecycle = (name: string) => () => {
+          observed.push(name);
+          if (throws) throw lifecycleError;
+        };
+        let operationRan = false;
+        let reportedError: Error | undefined;
+        const dispatchedAction = store.dispatch(
+          executeClusterAction({
+            callback: () => {
+              operationRan = true;
+              if (outcome === 'error') throw callbackError;
+            },
+            startMessage: 'Starting',
+            successMessage: 'Success',
+            errorMessage: 'Error',
+            cancelledMessage: 'Cancelled',
+            onSuccess: lifecycle('success'),
+            onError: error => {
+              reportedError = error;
+              lifecycle('error')();
+            },
+            onCancelled: lifecycle('cancel'),
+            cancelCallback: () => {
+              observed.push('legacy cancel');
+            },
+          })
+        );
+        if (outcome === 'cancel') {
+          const actionKey = Object.keys(store.getState().clusterAction)[0];
+          store.dispatch(cancelClusterAction(actionKey));
+        } else {
+          await vi.advanceTimersByTimeAsync(CLUSTER_ACTION_GRACE_PERIOD);
+        }
+        const result = await dispatchedAction;
+        expect(result.meta.requestStatus).toBe('fulfilled');
+        expect(operationRan).toBe(outcome !== 'cancel');
+        expect(observed).toEqual(outcome === 'cancel' ? ['legacy cancel', 'cancel'] : [outcome]);
+        expect(reportedError).toBe(outcome === 'error' ? callbackError : undefined);
+        const terminalActions = store
+          .getActions()
+          .filter(
+            action =>
+              action.type === updateClusterAction.type &&
+              ['complete', 'error'].includes(action.payload.state)
+          );
+        expect(terminalActions).toHaveLength(1);
+        expect(Object.values(store.getState().clusterAction)[0]).toMatchObject(
+          outcome === 'error'
+            ? {
+                state: 'error',
+                message: 'Error. Backend failed',
+                snackbarProps: { variant: 'error' },
+              }
+            : outcome === 'cancel'
+            ? { state: 'complete', message: 'Cancelled', autoHideDuration: 3000 }
+            : { state: 'complete', message: 'Success', snackbarProps: { variant: 'success' } }
+        );
+        if (throws) expect(logged.mock.calls.flat()).toContain(lifecycleError);
+        else expect(logged).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(3000);
+        expect(store.getState().clusterAction).toEqual({});
+      } finally {
+        logged.mockRestore();
+      }
     });
   });
 

@@ -43,8 +43,11 @@ import (
 )
 
 const (
-	oldTokenTTL   = time.Second * 10 // seconds
-	oidcKeyPrefix = "oidc-token-"
+	oldTokenTTL          = time.Second * 10 // seconds
+	oidcKeyPrefix        = "oidc-token-"
+	oidcIDTokenKeyPrefix = "oidc-id-token-" // #nosec G101 -- cache key prefix, not a credential
+	defaultIDTokenTTL    = 24 * time.Hour
+	clusterLogField      = "cluster"
 )
 
 const JWTExpirationTTL = 10 * time.Second // seconds
@@ -89,13 +92,41 @@ func BearerTokenValue(token string) string {
 	return strings.TrimSpace(token)
 }
 
+// StripBaseURL removes baseURL from the start of path so that a request made
+// under a path-based base URL can be matched against the /clusters/... routes.
+// The base URL only matches up to a "/" boundary, so "/foo" doesn't strip
+// "/foobar". The path is returned unchanged when it doesn't start with baseURL.
+func StripBaseURL(path, baseURL string) string {
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	if baseURL == "" {
+		return path
+	}
+
+	if path == baseURL {
+		return "/"
+	}
+
+	if strings.HasPrefix(path, baseURL+"/") {
+		return path[len(baseURL):]
+	}
+
+	return path
+}
+
 // ParseClusterAndToken extracts the cluster name from the URL path and
 // the Bearer token from the Authorization header of the HTTP request, falling
 // back to the cluster cookie when the header is missing.
 func ParseClusterAndToken(r *http.Request) (string, string) {
+	return ParseClusterAndTokenWithBaseURL(r, "")
+}
+
+// ParseClusterAndTokenWithBaseURL is like ParseClusterAndToken, but first
+// strips baseURL from the request path, for when Headlamp is served under a
+// path-based base URL.
+func ParseClusterAndTokenWithBaseURL(r *http.Request, baseURL string) (string, string) {
 	cluster := ""
 
-	matches := clusterPathRegex.FindStringSubmatch(r.URL.Path)
+	matches := clusterPathRegex.FindStringSubmatch(StripBaseURL(r.URL.Path, baseURL))
 	if len(matches) > 1 {
 		cluster = matches[1]
 	}
@@ -159,12 +190,72 @@ func IsTokenAboutToExpire(token string) bool {
 	return time.Until(expiryUnixTimeUTC) <= JWTExpirationTTL
 }
 
+// CacheIDToken retains the ID token associated with the authentication token.
+func CacheIDToken(
+	ctx context.Context,
+	tokenCache cache.Cache[interface{}],
+	authToken, idToken string,
+	ttl time.Duration,
+) error {
+	if authToken == "" || idToken == "" {
+		return nil
+	}
+
+	if ttl <= 0 {
+		ttl = defaultIDTokenTTL
+	}
+
+	if err := tokenCache.SetWithTTL(ctx, oidcIDTokenKeyPrefix+authToken, idToken, ttl); err != nil {
+		return fmt.Errorf("caching ID token: %w", err)
+	}
+
+	return nil
+}
+
+func oauthTokenValue(token *oauth2.Token, tokenType string) string {
+	if tokenType == "access_token" {
+		return token.AccessToken
+	}
+
+	value, _ := token.Extra(tokenType).(string)
+
+	return value
+}
+
+func retainIDTokenForRefreshedToken(
+	ctx context.Context,
+	token *oauth2.Token,
+	oldAuthToken, newAuthToken string,
+	tokenCache cache.Cache[interface{}],
+	sessionTTL time.Duration,
+) (*oauth2.Token, error) {
+	idToken, _ := token.Extra("id_token").(string)
+	if idToken == "" {
+		cachedIDToken, err := tokenCache.Get(ctx, oidcIDTokenKeyPrefix+oldAuthToken)
+		if err != nil && !errors.Is(err, cache.ErrNotFound) {
+			return nil, fmt.Errorf("getting cached ID token: %w", err)
+		}
+
+		idToken, _ = cachedIDToken.(string)
+	}
+
+	if idToken == "" {
+		return token, nil
+	}
+
+	if err := CacheIDToken(ctx, tokenCache, newAuthToken, idToken, sessionTTL); err != nil {
+		return nil, err
+	}
+
+	return token.WithExtra(map[string]interface{}{"id_token": idToken}), nil
+}
+
 // CacheRefreshedToken updates the refresh token in the cache.
 func CacheRefreshedToken(token *oauth2.Token, tokenType string, oldToken string,
 	oldRefreshToken string, cache cache.Cache[interface{}],
 ) error {
-	newToken, ok := token.Extra(tokenType).(string)
-	if !ok {
+	newToken := oauthTokenValue(token, tokenType)
+	if newToken == "" {
 		return nil
 	}
 
@@ -173,6 +264,10 @@ func CacheRefreshedToken(token *oauth2.Token, tokenType string, oldToken string,
 	if err := cache.Set(ctx, oidcKeyPrefix+newToken, token.RefreshToken); err != nil {
 		logger.Log(logger.LevelError, nil, err, "failed to cache refreshed token")
 		return err
+	}
+
+	if newToken == oldToken {
+		return nil
 	}
 
 	if err := cache.SetWithTTL(ctx, oidcKeyPrefix+oldToken, oldRefreshToken, oldTokenTTL); err != nil {
@@ -186,11 +281,11 @@ func CacheRefreshedToken(token *oauth2.Token, tokenType string, oldToken string,
 // GetNewToken uses the provided credentials and fetches the old refresh
 // token from the cache to obtain a new OAuth2 token
 // from the specified token URL endpoint.
-func GetNewToken(clientID, clientSecret string, cache cache.Cache[interface{}],
-	tokenType string, token string, tokenURL string, ctx context.Context,
+func GetNewToken(clientID, clientSecret string, tokenCache cache.Cache[interface{}],
+	tokenType string, token string, tokenURL string, ctx context.Context, sessionTTL time.Duration,
 ) (*oauth2.Token, error) {
 	// get refresh token
-	refreshToken, err := cache.Get(ctx, oidcKeyPrefix+token)
+	refreshToken, err := tokenCache.Get(ctx, oidcKeyPrefix+token)
 	if err != nil {
 		return nil, fmt.Errorf("getting refresh token: %w", err)
 	}
@@ -215,12 +310,37 @@ func GetNewToken(clientID, clientSecret string, cache cache.Cache[interface{}],
 		return nil, err
 	}
 
-	// update the refresh token in the cache
-	if err := CacheRefreshedToken(newToken, tokenType, token, rToken, cache); err != nil {
+	newAuthToken := oauthTokenValue(newToken, tokenType)
+	if newAuthToken == "" && tokenType == "id_token" {
+		newAuthToken = token
+	}
+
+	retainedToken, err := retainIDTokenForRefreshedToken(
+		ctx,
+		newToken,
+		token,
+		newAuthToken,
+		tokenCache,
+		sessionTTL,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("retaining refreshed ID token: %w", err)
+	}
+
+	// Update the refresh token cache after determining the effective authentication
+	// token, since providers may omit id_token in refresh responses.
+	if err := CacheRefreshedToken(retainedToken, tokenType, token, rToken, tokenCache); err != nil {
 		return nil, fmt.Errorf("caching refreshed token: %w", err)
 	}
 
-	return newToken, nil
+	if newAuthToken != token {
+		if err := tokenCache.UpdateTTL(ctx, oidcIDTokenKeyPrefix+token, oldTokenTTL); err != nil &&
+			!errors.Is(err, cache.ErrNotFound) {
+			return nil, fmt.Errorf("retaining previous cached ID token: %w", err)
+		}
+	}
+
+	return retainedToken, nil
 }
 
 // ConfigureTLSContext configures TLS settings for the HTTP client in the context.
@@ -229,25 +349,9 @@ func GetNewToken(clientID, clientSecret string, cache cache.Cache[interface{}],
 // re-enabling verification while trusting the supplied certificate bundle.
 func ConfigureTLSContext(ctx context.Context, skipTLSVerify *bool, caCert *string) context.Context {
 	if skipTLSVerify != nil && *skipTLSVerify {
-		base, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			logger.Log(logger.LevelError, nil,
-				errors.New("http.DefaultTransport is not *http.Transport"),
-				"failed to configure TLS transport")
-
-			return ctx
-		}
-
-		tlsSkipTransport := base.Clone()
-
-		tlsCfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec
-		if base.TLSClientConfig != nil {
-			tlsCfg = base.TLSClientConfig.Clone()
-			tlsCfg.InsecureSkipVerify = true
-		}
-
-		tlsSkipTransport.TLSClientConfig = tlsCfg
-		ctx = oidc.ClientContext(ctx, &http.Client{Transport: tlsSkipTransport})
+		ctx = configureTLSClientContext(ctx, func(config *tls.Config) {
+			config.InsecureSkipVerify = true
+		})
 	}
 
 	if caCert != nil && *caCert != "" {
@@ -259,30 +363,55 @@ func ConfigureTLSContext(ctx context.Context, skipTLSVerify *bool, caCert *strin
 			return ctx
 		}
 
-		base, ok := http.DefaultTransport.(*http.Transport)
-		if !ok {
-			logger.Log(logger.LevelError, nil,
-				errors.New("http.DefaultTransport is not *http.Transport"),
-				"failed to configure TLS transport")
-
-			return ctx
-		}
-
-		customTransport := base.Clone()
-
-		tlsCfg := &tls.Config{RootCAs: caCertPool}
-		if base.TLSClientConfig != nil {
-			tlsCfg = base.TLSClientConfig.Clone()
-			tlsCfg.RootCAs = caCertPool
-		}
-
-		tlsCfg.InsecureSkipVerify = false
-
-		customTransport.TLSClientConfig = tlsCfg
-		ctx = oidc.ClientContext(ctx, &http.Client{Transport: customTransport})
+		ctx = configureTLSClientContext(ctx, func(config *tls.Config) {
+			config.RootCAs = caCertPool
+			config.InsecureSkipVerify = false
+		})
 	}
 
 	return ctx
+}
+
+func configureTLSClientContext(
+	ctx context.Context, configure func(*tls.Config),
+) context.Context {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		logger.Log(logger.LevelError, nil,
+			errors.New("http.DefaultTransport is not *http.Transport"),
+			"failed to configure TLS transport")
+
+		return ctx
+	}
+
+	transport := base.Clone()
+
+	config := &tls.Config{MinVersion: tls.VersionTLS12}
+	if base.TLSClientConfig != nil {
+		config = base.TLSClientConfig.Clone()
+	}
+
+	configure(config)
+	transport.TLSClientConfig = config
+
+	return oidc.ClientContext(ctx, &http.Client{Transport: transport})
+}
+
+// WithClientTimeout returns a context whose HTTP client, the one oidc.ClientContext stores,
+// has the given timeout. It copies the client already in ctx (for example the one
+// ConfigureTLSContext installed) or http.DefaultClient, keeps its Transport and leaves the
+// original untouched. The timeout is on the client and not on the context because the
+// context can outlive the request that created it. Call it after the client is configured.
+func WithClientTimeout(ctx context.Context, timeout time.Duration) context.Context {
+	client := http.DefaultClient
+	if existing, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok && existing != nil {
+		client = existing
+	}
+
+	clientWithTimeout := *client
+	clientWithTimeout.Timeout = timeout
+
+	return oidc.ClientContext(ctx, &clientWithTimeout)
 }
 
 // RefreshAndCacheNewToken obtains a fresh OIDC token using the cached refresh token
@@ -293,6 +422,7 @@ func ConfigureTLSContext(ctx context.Context, skipTLSVerify *bool, caCert *strin
 func RefreshAndCacheNewToken(ctx context.Context, oidcAuthConfig *kubeconfig.OidcConfig,
 	cache cache.Cache[interface{}],
 	tokenType, token, issuerURL, validatorIssuerURL string,
+	sessionTTL time.Duration,
 ) (*oauth2.Token, error) {
 	ctx = ConfigureTLSContext(ctx, oidcAuthConfig.SkipTLSVerify, oidcAuthConfig.CACert)
 
@@ -314,6 +444,7 @@ func RefreshAndCacheNewToken(ctx context.Context, oidcAuthConfig *kubeconfig.Oid
 		token,
 		provider.Endpoint().TokenURL,
 		ctx,
+		sessionTTL,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("refreshing token: %w", err)
@@ -331,6 +462,8 @@ type MeHandlerOptions struct {
 	GroupsPaths string
 	// UserInfoURL is the URL to fetch additional user info for the /me endpoint.
 	UserInfoURL string
+	// BaseURL is the path Headlamp is served under, if any.
+	BaseURL string
 	// ProxyAuthEnabled indicates if the identity proxy bypass is enabled
 	ProxyAuthEnabled        bool
 	ProxyAuthUsernameHeader string
@@ -361,7 +494,7 @@ func HandleMe(opts MeHandlerOptions) http.HandlerFunc {
 			return
 		}
 
-		requestCluster, token := ParseClusterAndToken(r)
+		requestCluster, token := ParseClusterAndTokenWithBaseURL(r, opts.BaseURL)
 
 		if requestCluster == "" {
 			requestCluster = clusterName
@@ -531,6 +664,12 @@ func stringSliceFromJMESPaths(payload map[string]interface{}, paths []*jmespath.
 			return out
 		case []string:
 			return v
+		case string:
+			// The API server accepts a groups claim that is a single string,
+			// so treat it as one group rather than dropping it.
+			if v != "" {
+				return []string{v}
+			}
 		}
 	}
 
@@ -596,8 +735,49 @@ type RefreshAndSetTokenParams struct {
 	SessionTTL                int
 }
 
+func setRefreshedIDTokenCookie(
+	params RefreshAndSetTokenParams,
+	newToken *oauth2.Token,
+	authToken string,
+) {
+	refreshedIDToken, _ := newToken.Extra("id_token").(string)
+	if refreshedIDToken == "" && !params.OIDCUseAccessToken {
+		refreshedIDToken = authToken
+	}
+
+	if refreshedIDToken == "" {
+		return
+	}
+
+	if err := SetIDTokenCookie(
+		params.Writer,
+		params.Request,
+		params.Cluster,
+		refreshedIDToken,
+		params.BaseURL,
+		params.SessionTTL,
+	); err != nil {
+		logger.Log(logger.LevelWarn, map[string]string{clusterLogField: params.Cluster},
+			err, "failed to retain refreshed ID token for provider logout")
+	}
+}
+
+func refreshedTokenString(newToken *oauth2.Token, useAccessToken bool) (string, error) {
+	if useAccessToken {
+		if newToken.AccessToken != "" {
+			return newToken.AccessToken, nil
+		}
+	} else if idToken, ok := newToken.Extra("id_token").(string); ok && idToken != "" {
+		return idToken, nil
+	}
+
+	return "", errors.New("refreshed token missing expected field")
+}
+
 // RefreshAndSetToken refreshes an expiring token, updates the auth cookie,
 // and records telemetry based on the provided parameters.
+//
+//nolint:funlen // Updates both response cookies and current request identity.
 func RefreshAndSetToken(params RefreshAndSetTokenParams) {
 	// The token type to use
 	tokenType := "id_token"
@@ -618,35 +798,49 @@ func RefreshAndSetToken(params RefreshAndSetTokenParams) {
 		params.Token,
 		idpIssuerURL,
 		params.OIDCValidatorIdpIssuerURL,
+		time.Duration(params.SessionTTL)*time.Second,
 	)
 	if err != nil {
-		logger.Log(logger.LevelError, map[string]string{"cluster": params.Cluster},
+		logger.Log(logger.LevelError, map[string]string{clusterLogField: params.Cluster},
 			err, "failed to refresh token")
 		params.TelemetryHandler.RecordError(params.Span, err, "Token refresh failed")
 		params.TelemetryHandler.RecordErrorCount(params.Ctx, attribute.String("error", "token_refresh_failure"))
-	} else if newToken != nil {
-		var newTokenString string
 
-		var ok bool
-
-		if params.OIDCUseAccessToken {
-			newTokenString, ok = newToken.Extra("access_token").(string)
-		} else {
-			newTokenString, ok = newToken.Extra("id_token").(string)
-		}
-
-		if !ok || newTokenString == "" {
-			logger.Log(logger.LevelError, map[string]string{"cluster": params.Cluster},
-				errors.New("refreshed token missing expected field"), "failed to extract token string")
-			params.TelemetryHandler.RecordError(params.Span,
-				errors.New("refreshed token missing expected field"), "Token extraction failed")
-
-			return
-		}
-
-		// Set refreshed token in cookie
-		SetTokenCookie(params.Writer, params.Request, params.Cluster, newTokenString, params.BaseURL, params.SessionTTL)
-
-		params.TelemetryHandler.RecordEvent(params.Span, "Token refreshed successfully")
+		return
 	}
+
+	if newToken == nil {
+		return
+	}
+
+	newTokenString, err := refreshedTokenString(newToken, params.OIDCUseAccessToken)
+	if err != nil {
+		logger.Log(logger.LevelError, map[string]string{clusterLogField: params.Cluster},
+			err, "failed to extract token string")
+		params.TelemetryHandler.RecordError(params.Span, err, "Token extraction failed")
+
+		return
+	}
+
+	if err := SetTokenCookie(
+		params.Writer,
+		params.Request,
+		params.Cluster,
+		newTokenString,
+		params.BaseURL,
+		params.SessionTTL,
+	); err != nil {
+		logger.Log(logger.LevelError, map[string]string{clusterLogField: params.Cluster},
+			err, "failed to retain refreshed authentication token")
+		params.TelemetryHandler.RecordError(params.Span, err, "Refreshed token cookie storage failed")
+
+		return
+	}
+
+	setRefreshedIDTokenCookie(params, newToken, newTokenString)
+
+	// The current request must use the renewed credential, not only the next browser request.
+	params.Request.Header.Set("Authorization", "Bearer "+newTokenString)
+
+	params.TelemetryHandler.RecordEvent(params.Span, "Token refreshed successfully")
 }

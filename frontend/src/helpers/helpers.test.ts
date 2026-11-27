@@ -32,12 +32,22 @@ describe('getAppUrl', () => {
   test('dev mode and isElectron', () => {
     vi.spyOn(isDevMode, 'isDevMode').mockImplementation(() => true);
     vi.spyOn(isElectron, 'isElectron').mockImplementation(() => true);
-    expect(getAppUrl.getAppUrl()).toBe('http://localhost:4466/');
+    expect(getAppUrl.getAppUrl()).toBe('/');
   });
   test('isElectron, not dev mode', () => {
     vi.spyOn(isDevMode, 'isDevMode').mockImplementation(() => false);
     vi.spyOn(isElectron, 'isElectron').mockImplementation(() => true);
-    expect(getAppUrl.getAppUrl()).toBe('http://localhost:4466/');
+    expect(getAppUrl.getAppUrl()).toBe('/');
+  });
+
+  test('isElectron uses the confirmed IPv4 backend endpoint', () => {
+    vi.spyOn(isDevMode, 'isDevMode').mockImplementation(() => false);
+    vi.spyOn(isElectron, 'isElectron').mockImplementation(() => true);
+    windowSpy.mockImplementation(() => ({
+      headlampBackendPort: 4467,
+    }));
+
+    expect(getAppUrl.getAppUrl()).toBe('http://127.0.0.1:4467/');
   });
 
   test('base-url is set through headlampBaseUrl variable', () => {
@@ -57,7 +67,7 @@ describe('getAppUrl', () => {
     windowSpy.mockImplementation(() => ({
       headlampBaseUrl: '/headlamp',
     }));
-    expect(getAppUrl.getAppUrl()).toBe('http://localhost:4466/');
+    expect(getAppUrl.getAppUrl()).toBe('/');
   });
 
   test('base-url is used without dev mode and without isElectron, uses window.location.origin', () => {
@@ -85,5 +95,48 @@ describe('getAppUrl', () => {
       },
     }));
     expect(getAppUrl.getAppUrl()).toBe('http://example.com:4466/');
+  });
+
+  describe.each([
+    { mode: 'browser', dev: false, docker: false, origin: 'https://headlamp.example.com' },
+    { mode: 'development', dev: true, docker: false, origin: 'http://localhost:4466' },
+    { mode: 'Docker Desktop', dev: false, docker: true, origin: 'http://localhost:64446' },
+  ])('$mode base paths', ({ dev, docker, origin }) => {
+    test.each([
+      ['', '/'],
+      ['/', '/'],
+      ['.', '/'],
+      ['./', '/'],
+      ['/headlamp', '/headlamp/'],
+      ['headlamp', '/headlamp/'],
+      ['/headlamp/', '/headlamp/'],
+      ['headlamp/', '/headlamp/'],
+      ['/team/headlamp/', '/team/headlamp/'],
+      ['///headlamp///', '/headlamp/'],
+    ])('joins base path %j to the backend origin', (baseUrl, path) => {
+      vi.spyOn(isDevMode, 'isDevMode').mockReturnValue(dev);
+      vi.spyOn(isElectron, 'isElectron').mockReturnValue(false);
+      windowSpy.mockImplementation(() => ({
+        headlampBaseUrl: baseUrl,
+        location: { origin: 'https://headlamp.example.com' },
+        ddClient: docker ? {} : undefined,
+      }));
+
+      const appUrl = getAppUrl.getAppUrl();
+
+      expect(appUrl).toBe(`${origin}${path}`);
+      expect(new URL(`${appUrl}config`).pathname).toBe(`${path}config`);
+    });
+  });
+
+  test('Electron ignores the base path when its backend port is confirmed', () => {
+    vi.spyOn(isDevMode, 'isDevMode').mockReturnValue(false);
+    vi.spyOn(isElectron, 'isElectron').mockReturnValue(true);
+    windowSpy.mockImplementation(() => ({
+      headlampBaseUrl: '/headlamp/',
+      headlampBackendPort: 4467,
+    }));
+
+    expect(getAppUrl.getAppUrl()).toBe('http://127.0.0.1:4467/');
   });
 });
